@@ -53,7 +53,7 @@ class PtpInput(private val readChunk: (ByteArray) -> Int) {
         if (header.type == PtpCodec.RESPONSE) {
             require(header.size <= 32) { "PTP 响应长度无效" }
             bytes((header.size - PtpCodec.HEADER_SIZE).toInt())
-            if (header.code != PtpCodec.OK) throw PtpResponseException(header.code)
+            if (header.code != PtpCodec.OK) throw PtpResponseException(header.code, code, transaction)
             throw IOException("相机未返回照片数据")
         }
         require(header.type == PtpCodec.DATA && header.code == code) { "PTP 下载数据类型不匹配" }

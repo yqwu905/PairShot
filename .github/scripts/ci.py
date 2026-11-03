@@ -60,7 +60,7 @@ def metadata(properties, env):
         tag = ref.removeprefix("refs/tags/")
         name = tag.removeprefix("v")
         if not tag.startswith("v") or not VERSION.fullmatch(name) or name.split("-", 1)[0] != base:
-            raise ValueError("Version tag must match VERSION_NAME (for example v0.2.0 or v0.2.0-rc.1)")
+            raise ValueError(f"Version tag must match VERSION_NAME (for example v{base} or v{base}-rc.1)")
     else:
         tag = f"build-{number}"
         name = f"{base}-ci.{number}"

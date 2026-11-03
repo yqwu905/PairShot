@@ -2,6 +2,8 @@ package com.pairshot.app
 
 import android.Manifest
 import android.content.BroadcastReceiver
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -110,6 +112,7 @@ private fun CameraScreen(model: CameraViewModel = viewModel()) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_START -> { model.phone.refresh(); model.onForeground(true) }
+                Lifecycle.Event.ON_RESUME -> model.recheckUsbPermission()
                 Lifecycle.Event.ON_STOP -> model.onForeground(false)
                 else -> Unit
             }
@@ -119,7 +122,7 @@ private fun CameraScreen(model: CameraViewModel = viewModel()) {
         model.refresh()
         onDispose { lifecycle.removeObserver(observer); context.unregisterReceiver(receiver); model.onForeground(false) }
     }
-    val locked = state.busy || state.shooting || state.waitingCamera
+    val locked = state.busy || state.shooting || state.waitingCamera || state.permissionDeviceId != null
     Scaffold(containerColor = Background) { padding ->
         // Keep camera surfaces composed while scrolling; LazyColumn would release
         // an offscreen preview and interrupt a live Camera2 session.
@@ -165,6 +168,12 @@ private fun CameraScreen(model: CameraViewModel = viewModel()) {
                     }
                     OutlinedButton(onClick = model::refresh, enabled = !locked) { Text("刷新设备") }
                 }
+                Text(state.connectionMessage, color = if (state.info != null) Mint else Amber,
+                    style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("usb_connection_status"))
+                if (state.permissionDeviceId != null || (state.busy && state.info == null)) {
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                }
+                if (state.permissionDeviceId != null) TextButton(onClick = model::cancelPermissionRequest) { Text("停止等待授权") }
                 if (state.info?.captureMode == CaptureMode.NIKON_Z6) Text("Z6 适配：使用当前焦点，保存到存储卡；请先在相机端完成对焦。", color = Amber, style = MaterialTheme.typography.bodySmall)
                 if (state.info?.supportsCapture == false) Text("该型号暂未适配手机触发快门；可检测相机带动手机模式。", color = Amber, style = MaterialTheme.typography.bodySmall)
             }
@@ -255,7 +264,13 @@ private fun CameraScreen(model: CameraViewModel = viewModel()) {
                 }
             }
             TextButton(onClick = { showLogs = !showLogs }) { Text(if (showLogs) "收起连接日志" else "查看连接日志") }
-            if (showLogs) state.logs.forEach { Text(it, style = MaterialTheme.typography.labelSmall, color = Muted) }
+            if (showLogs) {
+                OutlinedButton(onClick = {
+                    context.getSystemService(ClipboardManager::class.java)
+                        .setPrimaryClip(ClipData.newPlainText("PairShot 诊断日志", model.diagnostics()))
+                }) { Text("复制诊断日志") }
+                state.logs.forEach { Text(it, style = MaterialTheme.typography.labelSmall, color = Muted) }
+            }
             Text("本地处理 · 无账号 · 无网络权限\nUSB 联机与多摄能力仍需目标相机和手机实测。", color = Muted, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(bottom = 16.dp))
         }
     }

@@ -9,7 +9,7 @@
 | --- | --- | --- |
 | Pull Request | 发布规则测试、Android 单元测试、Lint、Debug APK | 仅 Actions Artifact，不创建 Release，不使用签名 Secrets |
 | 推送到 `master` | 同上，成功后重新构建待发布 APK 并核对签名和版本 | 创建 `build-<run_number>` 预发布版 |
-| 推送 `v0.2.0` 等版本标签 | 标签必须与 `version.properties` 的版本匹配 | 创建同名 Release；未配置发行签名时始终标记为测试预发布版 |
+| 推送 `v0.2.1` 等版本标签 | 标签必须与 `version.properties` 的版本匹配 | 创建同名 Release；未配置发行签名时始终标记为测试预发布版 |
 | Actions → Run workflow | 在 `master` 或版本标签上运行完整流程 | 与上述分支/标签规则相同；其他分支不发布 |
 
 只在验证任务成功后发布。工作流先创建草稿，上传全部附件后再公开；失败的草稿可以通过重跑恢复。已公开的 Release 不覆盖、不移动已有版本标签；相同运行重跑时会核对来源提交、版本和证书后复用已有发布。
@@ -26,7 +26,7 @@ Actions 中另保留 CI APK 与测试报告 14 天，已验证发布附件保留
 
 ## 当前默认：可安装的测试 APK
 
-没有配置发行签名 Secrets 时，自动构建 Debug APK，并明确标记为预发布版。`master` 的版本例如 `0.2.0-ci.7`，标签为 `build-7`。
+没有配置发行签名 Secrets 时，自动构建 Debug APK，并明确标记为预发布版。`master` 的版本例如 `0.2.1-ci.7`，标签为 `build-7`。
 
 发布用的调试密钥通过 Actions Cache 尽量复用，便于覆盖安装，但缓存不是永久密钥备份，可能被清理。证书改变时 Android 会拒绝覆盖安装；请先导出应用内照片，再卸载旧测试版、安装新版本。第一次从本地安装包切换到 CI 包也可能遇到这种情况。检查 Release 中的证书指纹可判断是否使用相同签名。
 
@@ -63,7 +63,7 @@ gh secret set ANDROID_KEY_PASSWORD --repo yqwu905/PairShot
 基础版本集中在 `version.properties`：
 
 ```properties
-VERSION_NAME=0.2.0
+VERSION_NAME=0.2.1
 VERSION_CODE=2
 ```
 
@@ -74,8 +74,8 @@ VERSION_CODE=2
 例如发布当前版本：
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
 只有配置完整发行签名且使用稳定版本标签时才创建正式 Release；Debug 包、CI 构建和 RC/Alpha/Beta 版本均为预发布版。发布下一版前先提交 `version.properties` 的更新，再推送对应标签。

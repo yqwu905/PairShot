@@ -43,19 +43,38 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.Executors
+
+private val ptpCleanup = Executors.newSingleThreadExecutor { action ->
+    Thread(action, "PairShot-PTP-close").apply { isDaemon = true }
+}
+
+internal fun releasePtpSession(active: PtpSession) = ptpCleanup.submit {
+    runCatching { active.close() }.onFailure { active.abort() }
+}
 
 enum class SyncMode { PHONE_LEADS, CAMERA_LEADS }
 
 data class CameraState(
     val devices: List<UsbDevice> = emptyList(), val connectedDeviceId: Int? = null,
     val info: PtpDeviceInfo? = null, val status: String = "连接相机，开始双端拍摄",
+    val connectionMessage: String = "尚未连接相机会话",
+    val permissionDeviceId: Int? = null,
     val busy: Boolean = false, val armed: Boolean = false, val shooting: Boolean = false,
     val mode: SyncMode = SyncMode.PHONE_LEADS, val waitingCamera: Boolean = false,
     val progress: String = "", val preparedExport: String? = null,
     val history: List<CaptureSession> = emptyList(), val logs: List<String> = emptyList(),
 )
 
-class CameraViewModel(application: Application) : AndroidViewModel(application) {
+class CameraViewModel @JvmOverloads constructor(
+    application: Application,
+    private val sessionFactory: (UsbManager, UsbDevice, (String) -> Unit) -> PtpSession = { manager, device, diagnostic ->
+        PtpSession(UsbPtpTransport.open(manager, device), diagnostic)
+    },
+    private val permissionRequester: (UsbManager, UsbDevice, PendingIntent) -> Unit = { manager, device, pending ->
+        manager.requestPermission(device, pending)
+    },
+) : AndroidViewModel(application) {
     private val manager = application.getSystemService(UsbManager::class.java)
     val store = SessionStore(File(application.filesDir, "sessions"))
     val phone = PhoneCameraController(application, store)
@@ -65,6 +84,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private var sessionDeviceId: Int? = null
     private var generation = 0
     private var connection = ""
+    private var permissionDevice: UsbDevice? = null
     private var syncJob: Job? = null
     private var syncGeneration = 0
     private var foreground = false
@@ -77,33 +97,89 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     init { refresh() }
 
     private fun status(message: String) {
-        mutable.update { it.copy(status = message, logs = (listOf("${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())}  $message") + it.logs).take(30)) }
+        mutable.update { it.copy(status = message) }
+        protocolLog(message)
+    }
+    private fun connectionStatus(message: String) {
+        mutable.update { it.copy(connectionMessage = message) }
+        status(message)
+    }
+    private fun protocolLog(message: String) {
+        val time = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(Date())
+        mutable.update { it.copy(logs = (listOf("$time  $message") + it.logs).take(120)) }
+    }
+    fun diagnostics(): String {
+        val app = getApplication<Application>()
+        val packageInfo = app.packageManager.getPackageInfo(app.packageName, 0)
+        val info = mutable.value.info
+        return buildString {
+            appendLine("PairShot ${packageInfo.versionName} (${packageInfo.longVersionCode})")
+            appendLine("Android ${android.os.Build.VERSION.RELEASE} / ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
+            info?.let { appendLine("相机 ${it.manufacturer} ${it.model}，固件 ${it.version}") }
+            appendLine("联动模式 ${mutable.value.mode}，状态 ${mutable.value.status}")
+            appendLine("不包含照片或相机序列号。日志按时间顺序：")
+            mutable.value.logs.asReversed().forEach { appendLine(it) }
+        }
     }
     fun refresh() {
         mutable.update { it.copy(devices = manager.deviceList.values.filter(UsbPtpTransport::isCamera).sortedBy(UsbDevice::getDeviceName)) }
+        val waiting = permissionDevice
+        if (waiting != null && manager.deviceList[waiting.deviceName]?.let(manager::hasPermission) == true) {
+            onPermissionResult(null)
+        }
     }
     fun requestConnection(device: UsbDevice) {
-        if (mutable.value.busy || session != null) return
+        if (mutable.value.busy || session != null || permissionDevice != null) return
         if (manager.hasPermission(device)) connect(device) else {
             val context = getApplication<Application>()
+            // An immutable PendingIntent cannot rely on system fill-in extras.
+            // Seed the device ourselves and retain it across an empty callback.
             val intent = Intent(permissionAction).setPackage(context.packageName)
+                .putExtra(UsbManager.EXTRA_DEVICE, device)
             val permission = PendingIntent.getBroadcast(context, device.deviceId, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-            runCatching { manager.requestPermission(device, permission) }.onFailure { status(it.message ?: "无法请求 USB 授权") }
+            permissionDevice = device
+            mutable.update { it.copy(permissionDeviceId = device.deviceId) }
+            connectionStatus("等待系统 USB 授权，允许后会自动连接相机…")
+            runCatching { permissionRequester(manager, device, permission) }.onFailure {
+                clearPermissionRequest()
+                connectionStatus(it.message ?: "无法请求 USB 授权")
+            }
         }
     }
     fun onPermissionResult(device: UsbDevice?) {
-        if (device == null) return
-        if (manager.hasPermission(device)) connect(device) else status("USB 授权未通过，可点击设备重新授权")
+        val requested = permissionDevice ?: return
+        if (device != null && device.deviceName != requested.deviceName) return
+        val attached = manager.deviceList[requested.deviceName]?.takeIf {
+            it.vendorId == requested.vendorId && it.productId == requested.productId
+        }
+        clearPermissionRequest()
+        if (attached == null) connectionStatus("相机已拔出，请连接后再授权")
+        else if (manager.hasPermission(attached)) connect(attached)
+        else connectionStatus("USB 授权未通过，可点击设备重新授权")
+    }
+    fun recheckUsbPermission() {
+        // Some Android builds omit extras or the callback; check system permission
+        // again when the authorization window returns focus to the activity.
+        if (permissionDevice != null) onPermissionResult(null)
+    }
+    fun cancelPermissionRequest() {
+        if (permissionDevice == null) return
+        clearPermissionRequest()
+        connectionStatus("已停止等待 USB 授权，可重新点击连接")
+    }
+    private fun clearPermissionRequest() {
+        permissionDevice = null
+        mutable.update { it.copy(permissionDeviceId = null) }
     }
     private fun connect(device: UsbDevice) {
         if (mutable.value.busy || session != null) return
         val current = ++generation
         sessionDeviceId = device.deviceId
-        mutable.update { it.copy(busy = true) }; status("正在打开 PTP 会话…")
+        mutable.update { it.copy(busy = true) }; connectionStatus("USB 已授权，正在打开相机会话…")
         viewModelScope.launch {
             var candidate: PtpSession? = null
             try {
-                withContext(Dispatchers.IO) { candidate = PtpSession(UsbPtpTransport.open(manager, device)) }
+                withContext(Dispatchers.IO) { candidate = sessionFactory(manager, device, ::protocolLog) }
                 val active = checkNotNull(candidate)
                 if (generation != current) { active.abort(); return@launch }
                 session = active
@@ -111,11 +187,14 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 if (generation == current) {
                     connection = UUID.randomUUID().toString()
                     mutable.update { it.copy(connectedDeviceId = device.deviceId, info = info) }
-                    status("${info.model} 已连接 · ${if (info.supportsNikonEvents) "尼康事件查询可用" else "文件轮询模式"}")
+                    connectionStatus("${info.model} 已连接 · ${if (info.supportsNikonEvents) "尼康事件查询可用" else "文件轮询模式"}")
                 }
             } catch (error: Exception) {
                 candidate?.abort()
-                if (generation == current) { session = null; sessionDeviceId = null; status(error.message ?: "连接失败") }
+                if (generation == current) {
+                    session = null; sessionDeviceId = null
+                    connectionStatus("相机会话连接失败：${error.message ?: "请查看诊断日志"}")
+                }
                 if (error is CancellationException) throw error
             } finally { if (generation == current) mutable.update { it.copy(busy = false) } }
         }
@@ -133,6 +212,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     fun onForeground(value: Boolean) {
         foreground = value
         if (!value) stopSync()
+        else refresh()
         phone.setRunning(value)
     }
 
@@ -150,9 +230,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             try {
                 val handles = withContext(Dispatchers.IO) {
                     store.bind(info)
-                    active.useLocalShutter()
-                    if (info.supportsNikonEvents) runCatching { active.nikonEvents() }.getOrElse { if (it is PtpResponseException) emptyList() else throw it }
-                    active.objectHandles().toSet()
+                    active.prepareSync()
                 }
                 if (generation != current || syncGeneration != armToken || !foreground) return@launch
                 seen.clear(); seen.addAll(handles); cameraGroups.clear(); pending = null
@@ -161,7 +239,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 startMonitor(active, info)
             } catch (error: Exception) {
                 status(error.message ?: "无法开启联动")
-                if (error !is PtpResponseException && error is java.io.IOException) failConnection(error)
+                if (!active.isOpen || (error !is PtpResponseException && error is java.io.IOException)) failConnection(error)
                 if (error is CancellationException) throw error
             } finally { if (generation == current) mutable.update { it.copy(busy = false) } }
         }
@@ -334,7 +412,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         generation++
         stopSync(); session?.abort(); session = null; sessionDeviceId = null
         mutable.update { it.copy(connectedDeviceId = null, info = null, busy = false) }
-        status("连接已释放：${error.message ?: "请重新插拔相机"}")
+        connectionStatus("连接已释放：${error.message ?: "请重新连接相机"}")
     }
 
     fun disconnect() {
@@ -345,12 +423,16 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         session = null; sessionDeviceId = null
         mutable.update { it.copy(busy = true, connectedDeviceId = null, info = null) }
         viewModelScope.launch {
-            try { withContext(Dispatchers.IO) { active.close() }; status("相机已断开") }
-            catch (error: Exception) { status("连接已释放；如相机仍被占用，请重新插拔数据线") }
+            try { withContext(Dispatchers.IO) { active.close() }; connectionStatus("相机已断开") }
+            catch (error: Exception) { connectionStatus("连接已释放：${error.message ?: "请重新连接相机"}") }
             finally { if (generation == current) mutable.update { it.copy(busy = false) } }
         }
     }
     fun onDetached(device: UsbDevice?) {
+        if (device != null && device.deviceName == permissionDevice?.deviceName) {
+            clearPermissionRequest()
+            connectionStatus("授权期间相机已拔出")
+        }
         if (device?.deviceId == sessionDeviceId) failConnection(IllegalStateException("相机已拔出"))
         refresh()
     }
@@ -471,7 +553,14 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     override fun onCleared() {
-        generation++; syncJob?.cancel(); session?.abort(); phone.close()
+        generation++; syncJob?.cancel()
+        val active = session
+        session = null
+        sessionDeviceId = null
+        // viewModelScope is being cancelled; close the camera-side session on an
+        // independent I/O worker before releasing USB. Detach/error paths still abort.
+        if (active != null) releasePtpSession(active)
+        phone.close()
         super.onCleared()
     }
 }

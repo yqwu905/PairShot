@@ -17,6 +17,8 @@ object PtpCodec {
     const val RESPONSE = 3
     const val EVENT = 4
     const val OK = 0x2001
+    const val SESSION_NOT_OPEN = 0x2003
+    const val SESSION_ALREADY_OPEN = 0x201e
     const val GET_DEVICE_INFO = 0x1001
     const val OPEN_SESSION = 0x1002
     const val CLOSE_SESSION = 0x1003
@@ -31,6 +33,23 @@ object PtpCodec {
     const val NIKON_CHANGE_CAMERA_MODE = 0x90c2
     const val NIKON_DEVICE_READY = 0x90c8
     const val NIKON_CAPTURE_TO_MEDIA = 0x9207
+
+    fun operationName(code: Int): String = when (code) {
+        GET_DEVICE_INFO -> "GetDeviceInfo"
+        OPEN_SESSION -> "OpenSession"
+        CLOSE_SESSION -> "CloseSession"
+        GET_OBJECT_HANDLES -> "GetObjectHandles"
+        GET_OBJECT_INFO -> "GetObjectInfo"
+        GET_OBJECT -> "GetObject"
+        INITIATE_CAPTURE -> "InitiateCapture"
+        NIKON_GET_EVENT -> "Nikon.GetEvent"
+        NIKON_CHANGE_CAMERA_MODE -> "Nikon.ChangeCameraMode"
+        NIKON_DEVICE_READY -> "Nikon.DeviceReady"
+        NIKON_CAPTURE_TO_MEDIA -> "Nikon.CaptureToMedia"
+        else -> "PTP"
+    }
+
+    fun hex(code: Int): String = "0x%04X".format(Locale.ROOT, code)
 
     fun command(code: Int, transaction: Long, vararg parameters: Long): ByteArray {
         require(parameters.size <= 5)
@@ -148,7 +167,7 @@ interface PtpTransport : Closeable {
         val container = receive()
         require(container.transaction == transaction) { "PTP 数据事务不匹配" }
         if (container.type == PtpCodec.RESPONSE) {
-            if (container.code != PtpCodec.OK) throw PtpResponseException(container.code)
+            if (container.code != PtpCodec.OK) throw PtpResponseException(container.code, code, transaction)
             throw IOException("相机未返回照片数据")
         }
         require(container.type == PtpCodec.DATA && container.code == code) { "PTP 数据类型不匹配" }
@@ -193,39 +212,112 @@ data class PtpObjectInfo(
     }
 }
 
-class PtpResponseException(val responseCode: Int) : IOException(
+class PtpResponseException(
+    val responseCode: Int,
+    val operationCode: Int? = null,
+    val transactionId: Long? = null,
+) : IOException(
     when (responseCode) {
+        0x2003 -> "相机会话已失效"
+        0x2004 -> "相机事务序号异常"
         0x2005 -> "相机不支持此操作"
         0x200f -> "相机拒绝访问，请检查相机的 USB 连接模式"
         0x2019 -> "相机忙，请稍后再试"
         0x201d -> "相机参数不支持，请检查拍摄模式"
-        0x201e -> "相机已有会话，请重新插拔数据线"
+        0x201e -> if (operationCode == PtpCodec.OPEN_SESSION || operationCode == null) "相机存在尚未结束的会话" else "相机返回会话状态异常"
         0xa002 -> "相机未合焦，请先在相机端完成对焦"
         0xa004 -> "相机当前状态无法拍摄，请检查拍摄模式及相机屏幕"
         0xa008 -> "当前为 B 门模式，首版暂不支持长按快门"
         0xa021 -> "相机存储错误，请检查存储卡"
         0xa022 -> "相机存储卡未格式化，请在相机端检查"
         else -> "相机返回错误：0x${responseCode.toString(16)}"
-    },
+    } + "（返回 ${PtpCodec.hex(responseCode)}" +
+        (operationCode?.let { "，${PtpCodec.operationName(it)} ${PtpCodec.hex(it)}" } ?: "") +
+        (transactionId?.let { "，事务 $it" } ?: "") + "）",
 )
 
 /** A single USB session. Call serially on an I/O thread, never the main thread. */
-class PtpSession(private val transport: PtpTransport) : Closeable {
+class PtpSession(
+    private val transport: PtpTransport,
+    private val diagnostic: (String) -> Unit = {},
+) : Closeable {
     private var nextTransaction = 1L
-    private var opened = false
+    @Volatile private var opened = false
+    val isOpen: Boolean get() = opened
     private var info: PtpDeviceInfo? = null
     private var nikonControlMode = false
     private var nikonModeAttempted = false
 
     @Synchronized fun open(): PtpDeviceInfo {
         check(!opened) { "PTP 会话已经打开" }
-        val data = transact(PtpCodec.GET_DEVICE_INFO, 0)
-        val deviceInfo = PtpDeviceInfo.decode(requireNotNull(data) { "相机未返回设备信息" })
-        transact(PtpCodec.OPEN_SESSION, 0, 1)
-        info = deviceInfo
-        opened = true
-        return deviceInfo
+        try {
+            val data = transact(PtpCodec.GET_DEVICE_INFO, 0)
+            val deviceInfo = PtpDeviceInfo.decode(requireNotNull(data) { "相机未返回设备信息" })
+            try {
+                transact(PtpCodec.OPEN_SESSION, 0, 1)
+                opened = true
+            } catch (error: PtpResponseException) {
+                if (error.responseCode != PtpCodec.SESSION_ALREADY_OPEN) throw error
+                trace("检测到遗留 PTP 会话，关闭后重新建立一次")
+                restartSession()
+            }
+            info = deviceInfo
+            return deviceInfo
+        } catch (error: Exception) {
+            abort()
+            throw error
+        }
     }
+
+    /** Called only while arming, before any shutter is sent. Never retries a capture. */
+    @Synchronized fun prepareSync(): Set<Long> {
+        check(opened) { "相机尚未连接" }
+        try {
+            return readBaseline()
+        } catch (error: PtpResponseException) {
+            if (!error.isSessionError) throw error
+            trace("开启联动时会话状态异常，重建会话并重新读取基线一次")
+            try {
+                restartSession()
+                return readBaseline()
+            } catch (retryError: Exception) {
+                // Do not leave the UI claiming a usable connection after recovery fails.
+                abort()
+                throw retryError
+            }
+        }
+    }
+
+    private val PtpResponseException.isSessionError: Boolean
+        get() = responseCode == PtpCodec.SESSION_ALREADY_OPEN || responseCode == PtpCodec.SESSION_NOT_OPEN
+
+    private fun readBaseline(): Set<Long> {
+        useLocalShutter()
+        if (info?.supportsNikonEvents == true) {
+            try { nikonEvents() } catch (error: PtpResponseException) {
+                if (error.responseCode != 0x2005) throw error
+                trace("尼康事件查询不受支持，使用新文件扫描")
+            }
+        }
+        return objectHandles().toSet()
+    }
+
+    private fun restartSession() {
+        opened = false
+        try {
+            transact(PtpCodec.CLOSE_SESSION, nextTransaction++)
+        } catch (error: PtpResponseException) {
+            if (error.responseCode != PtpCodec.SESSION_NOT_OPEN) throw error
+        }
+        nikonControlMode = false
+        nikonModeAttempted = false
+        nextTransaction = 1L
+        transact(PtpCodec.OPEN_SESSION, 0, 1)
+        opened = true
+        trace("PTP 会话已重建，事务号从 1 重新开始")
+    }
+
+    private fun trace(message: String) { runCatching { diagnostic(message) } }
 
     @Synchronized fun capture(): Long {
         check(opened) { "相机尚未连接" }
@@ -294,11 +386,12 @@ class PtpSession(private val transport: PtpTransport) : Closeable {
         val count = transport.receiveData(PtpCodec.GET_OBJECT, transaction, output)
         val response = transport.receive()
         require(response.type == PtpCodec.RESPONSE && response.transaction == transaction) { "PTP 下载响应事务不匹配" }
-        if (response.code != PtpCodec.OK) throw PtpResponseException(response.code)
+        if (response.code != PtpCodec.OK) throw PtpResponseException(response.code, PtpCodec.GET_OBJECT, transaction)
         return count
     }
 
     private fun transact(code: Int, transaction: Long, vararg parameters: Long): ByteArray? {
+        trace("→ ${PtpCodec.operationName(code)} ${PtpCodec.hex(code)} tx=$transaction")
         transport.send(PtpCodec.command(code, transaction, *parameters))
         var result: ByteArray? = null
         var container = transport.receive()
@@ -307,8 +400,11 @@ class PtpSession(private val transport: PtpTransport) : Closeable {
             result = container.payload
             container = transport.receive()
         }
-        require(container.type == PtpCodec.RESPONSE && container.transaction == transaction) { "PTP 响应事务不匹配" }
-        if (container.code != PtpCodec.OK) throw PtpResponseException(container.code)
+        require(container.type == PtpCodec.RESPONSE && container.transaction == transaction) {
+            "${PtpCodec.operationName(code)} 的 PTP 响应事务不匹配：预期 $transaction，收到 ${container.transaction}"
+        }
+        trace("← ${PtpCodec.operationName(code)} tx=$transaction RC=${PtpCodec.hex(container.code)}")
+        if (container.code != PtpCodec.OK) throw PtpResponseException(container.code, code, transaction)
         return result
     }
 
