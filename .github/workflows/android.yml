@@ -1,27 +1,171 @@
-name: Android
+name: Android CI/CD
+
 on:
-  push:
   pull_request:
+  push:
+    branches: [master]
+    tags: ['v[0-9]*']
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  verify:
+    name: Test, lint and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin
           java-version: '21'
-      - uses: android-actions/setup-android@v3
-      - uses: gradle/actions/setup-gradle@v4
-      - name: Install SDK
-        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
-      - name: Build, test and lint
-        run: ./gradlew --no-daemon --max-workers=4 assembleDebug testDebugUnitTest lintDebug
-      - uses: actions/upload-artifact@v4
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
-          name: PairShot-debug
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
+          log-accepted-android-sdk-licenses: false
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-provider: basic
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+      - name: Check release metadata and signing rules
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+      - name: Compute build version
+        id: metadata
+        run: python3 .github/scripts/ci.py metadata --output "$RUNNER_TEMP/build-metadata.json"
+      - name: Build, test and lint
+        env:
+          VERSION_NAME: ${{ steps.metadata.outputs.version_name }}
+          VERSION_CODE: ${{ steps.metadata.outputs.version_code }}
+        run: >-
+          ./gradlew --no-daemon --max-workers=4
+          "-PpairshotVersionName=$VERSION_NAME" "-PpairshotVersionCode=$VERSION_CODE"
+          assembleDebug testDebugUnitTest lintDebug
+      - name: Upload CI APK
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: PairShot-CI-${{ github.run_number }}
           path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      - name: Upload test and lint reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Android-reports-${{ github.run_number }}
+          path: |
+            app/build/reports/tests/
+            app/build/test-results/
+            app/build/reports/lint-results-debug.*
+          if-no-files-found: ignore
+          retention-days: 14
+
+  publish:
+    name: Publish verified APK
+    needs: verify
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
+          log-accepted-android-sdk-licenses: false
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-provider: basic
+      - name: Compute release metadata
+        id: metadata
+        run: python3 .github/scripts/ci.py metadata --output "$RUNNER_TEMP/build-metadata.json"
+      - name: Select signing configuration
+        id: signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: python3 .github/scripts/ci.py signing --directory "$RUNNER_TEMP/pairshot-signing"
+      - name: Restore test signing key
+        if: steps.signing.outputs.variant == 'debug'
+        id: debug-key
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/pairshot-debug-key/debug.keystore
+          key: pairshot-debug-keystore-v1
+      - name: Prepare test signing key
+        if: steps.signing.outputs.variant == 'debug'
+        run: |
+          mkdir -p "$RUNNER_TEMP/pairshot-debug-key"
+          if [ ! -f "$RUNNER_TEMP/pairshot-debug-key/debug.keystore" ]; then
+            keytool -genkeypair -noprompt -storetype JKS -keyalg RSA -keysize 2048 \
+              -validity 10000 -alias androiddebugkey -storepass android -keypass android \
+              -dname 'CN=Android Debug,O=Android,C=US' \
+              -keystore "$RUNNER_TEMP/pairshot-debug-key/debug.keystore"
+          fi
+      - name: Build installable APK
+        env:
+          VARIANT: ${{ steps.signing.outputs.variant }}
+          VERSION_NAME: ${{ steps.metadata.outputs.version_name }}
+          VERSION_CODE: ${{ steps.metadata.outputs.version_code }}
+          PAIRSHOT_RELEASE_KEYSTORE: ${{ steps.signing.outputs.keystore }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          PAIRSHOT_DEBUG_KEYSTORE: ${{ runner.temp }}/pairshot-debug-key/debug.keystore
+        run: |
+          if [ "$VARIANT" = 'release' ]; then
+            unset PAIRSHOT_DEBUG_KEYSTORE
+            task='assembleRelease'
+          else
+            task='assembleDebug'
+          fi
+          ./gradlew --no-daemon --max-workers=4 \
+            "-PpairshotVersionName=$VERSION_NAME" "-PpairshotVersionCode=$VERSION_CODE" "$task"
+      - name: Verify APK signature, version and checksums
+        env:
+          VARIANT: ${{ steps.signing.outputs.variant }}
+        run: |
+          python3 .github/scripts/ci.py package \
+            --apk "app/build/outputs/apk/$VARIANT/app-$VARIANT.apk" \
+            --variant "$VARIANT" --metadata "$RUNNER_TEMP/build-metadata.json" \
+            --build-tools "$ANDROID_HOME/build-tools/36.0.0" --directory "$RUNNER_TEMP/pairshot-dist"
+      - name: Save test signing key
+        if: steps.signing.outputs.variant == 'debug' && steps.debug-key.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/pairshot-debug-key/debug.keystore
+          key: pairshot-debug-keystore-v1
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: PairShot-release-${{ github.run_number }}
+          path: ${{ runner.temp }}/pairshot-dist/*
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/ci.py publish --directory "$RUNNER_TEMP/pairshot-dist"
+      - name: Remove signing material from runner
+        if: ${{ always() }}
+        run: rm -rf "$RUNNER_TEMP/pairshot-signing" "$RUNNER_TEMP/pairshot-debug-key"

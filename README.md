@@ -1,5 +1,8 @@
 # PairShot · Android 手机与尼康相机联动拍摄
 
+[![Android CI/CD](https://github.com/yqwu905/PairShot/actions/workflows/android.yml/badge.svg)](https://github.com/yqwu905/PairShot/actions/workflows/android.yml)
+[下载自动构建的 APK](https://github.com/yqwu905/PairShot/releases) · [CI/CD 与签名配置](docs/ci-cd.md)
+
 PairShot 是一个原生 Android 应用：手机通过 USB / OTG 数据线连接相机，使用 Camera2 拍摄手机照片，通过 PTP 控制/检测实体相机拍摄，复制本次配对的相机原片，最后导出一个 ZIP。
 
 **当前版本 0.2.0，属于待实机验证的开发测试版。优先适配尼康，已有精确型号的扩展快门适配为 Z6 第一代。没有物理手机和相机接入本开发环境，不能将软件测试通过视为硬件兼容性确认。**
@@ -24,6 +27,12 @@ PairShot 是一个原生 Android 应用：手机通过 USB / OTG 数据线连接
 - 若必须在相机快门按下时立即拍摄手机，需要在明确相机型号、固件和可用接口后增加并验证厂商适配，或设计外部硬件触发链路。
 - 相机本地连拍可能比手机处理更快。来不及跟拍的组会标为缺少手机照片，不会悄悄归为成功。
 - 手机触发模式一次仅允许一组待配对拍摄。没有可用的相机事务号时，按“唯一待拍记录 + 第一组新照片”关联；请勿同时在相机上独立拍摄。不能用未经校准的相机时钟证明同时曝光。
+
+## 自动构建与发布
+
+`master` 更新后自动运行发布规则检查、35 项 Android 测试和 Lint，通过后发布可安装的测试 APK 到 [GitHub Releases](https://github.com/yqwu905/PairShot/releases)。PR 只验证和保存 Artifact。版本标签 `v0.2.0` 等会触发对应版本发布。
+
+默认使用缓存的调试签名，所有 Debug 包明确标记为预发布版；缓存被清理后签名可能变化，覆盖安装前需核对证书并先导出照片。正式签名可通过四个 GitHub Secrets 配置，细节见 [CI/CD 文档](docs/ci-cd.md)。
 
 ## 构建与安装
 

@@ -10,3 +10,9 @@ local.properties
 
 work/
 output/
+
+*.p12
+*.pfx
+*.pem
+__pycache__/
+dist/
