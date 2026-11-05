@@ -15,6 +15,8 @@ import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
+const val PHONE_ONLY_MODE = "PHONE_ONLY"
+
 fun sha256(file: File): String {
     val digest = MessageDigest.getInstance("SHA-256")
     file.inputStream().use { input ->
@@ -34,14 +36,18 @@ data class PhonePhoto(
     val lens: String, val label: String, val path: String, val size: Long, val sha256: String,
     val sensorTimestampNs: Long, val timestampSource: String,
     val requestedAtElapsedNs: Long, val callbackAtElapsedNs: Long,
+    val nominalFocalLengthMm: Float? = null, val requestedZoomRatio: Float = 1f,
 ) {
     fun json() = JSONObject().put("lens", lens).put("label", label).put("path", path).put("bytes", size)
         .put("sha256", sha256).put("sensorTimestampNs", sensorTimestampNs).put("timestampSource", timestampSource)
         .put("requestedAtElapsedNs", requestedAtElapsedNs).put("callbackAtElapsedNs", callbackAtElapsedNs)
+        .put("nominalFocalLengthMm", nominalFocalLengthMm).put("requestedZoomRatio", requestedZoomRatio)
     companion object {
         fun from(j: JSONObject) = PhonePhoto(j.getString("lens"), j.getString("label"), j.getString("path"), j.getLong("bytes"),
             j.getString("sha256"), j.getLong("sensorTimestampNs"), j.getString("timestampSource"),
-            j.getLong("requestedAtElapsedNs"), j.getLong("callbackAtElapsedNs"))
+            j.getLong("requestedAtElapsedNs"), j.getLong("callbackAtElapsedNs"),
+            if (j.has("nominalFocalLengthMm")) j.getDouble("nominalFocalLengthMm").toFloat() else null,
+            j.optDouble("requestedZoomRatio", 1.0).toFloat())
     }
 }
 
@@ -64,10 +70,11 @@ data class ShotRecord(
     val wallTimeMs: Long = System.currentTimeMillis(), val triggerElapsedNs: Long,
     val lenses: List<String>, val phone: List<PhonePhoto> = emptyList(),
     val camera: List<RemotePhoto> = emptyList(), val errors: List<String> = emptyList(),
-    val awaitingCamera: Boolean = true, val cameraTransaction: Long = 0,
+    val awaitingCamera: Boolean = mode != PHONE_ONLY_MODE, val cameraTransaction: Long = 0,
 ) {
-    val complete: Boolean get() = !awaitingCamera && lenses.isNotEmpty() && phone.size == lenses.size &&
-        camera.isNotEmpty() && camera.all { it.path.isNotEmpty() && it.error.isEmpty() } && errors.isEmpty()
+    val phoneOnly: Boolean get() = mode == PHONE_ONLY_MODE
+    val complete: Boolean get() = !awaitingCamera && lenses.isNotEmpty() && phone.map { it.lens }.sorted() == lenses.sorted() &&
+        (if (phoneOnly) camera.isEmpty() else camera.isNotEmpty() && camera.all { it.path.isNotEmpty() && it.error.isEmpty() }) && errors.isEmpty()
     fun json() = JSONObject().put("id", id).put("mode", mode).put("wallTimeMs", wallTimeMs)
         .put("triggerElapsedNs", triggerElapsedNs).put("expectedLenses", JSONArray(lenses))
         .put("phone", JSONArray(phone.map { it.json() })).put("camera", JSONArray(camera.map { it.json() }))
@@ -90,7 +97,8 @@ data class CaptureSession(
         .put("cameraIdentitySha256", cameraIdentity).put("cameraName", cameraName).put("reliableIdentity", reliableIdentity)
         .put("syncSemantics", "Best-effort software triggering. Camera-led mode is triggered by ObjectAdded or file discovery AFTER exposure. No hardware exposure synchronization is claimed.")
         .put("clockNotes", "Elapsed nanoseconds use Android elapsedRealtimeNanos; sensor timestamps are comparable only when timestampSource is REALTIME. Camera captureDate is uncalibrated camera-local time. No camera sensor timestamp is available.")
-        .put("matchingNotes", "RAW+JPEG group by storage/parent/filename stem. Phone-led matching requires one outstanding capture and no independent camera shots. Verify physical results.")
+        .put("matchingNotes", "PHONE_ONLY shots require only the selected phone photos; no USB camera or remote files are expected. RAW+JPEG group by storage/parent/filename stem. Phone-led matching requires one outstanding capture and no independent camera shots. Verify physical results.")
+        .put("focalLengthNotes", "nominalFocalLengthMm is the first focal length reported by CameraCharacteristics, not a 35mm equivalent or a measured capture focal length. requestedZoomRatio is the requested view ratio; logical cameras may crop or switch physical lenses. Physical outputs use their native view at 1x.")
         .put("shots", JSONArray(shots.map { it.json() }))
     companion object {
         fun from(j: JSONObject) = CaptureSession(j.getString("id"), j.getLong("createdMs"), j.optString("cameraIdentitySha256"),
@@ -115,7 +123,7 @@ class SessionStore(private val root: File) {
         for (file in journals) {
             val loaded = runCatching { AtomicFile(file).openRead().bufferedReader().use { CaptureSession.from(JSONObject(it.readText())) } }.getOrNull()
             if (loaded != null && loaded.id == file.parentFile?.name) return loaded.copy(shots = loaded.shots.map { shot ->
-                if (shot.awaitingCamera) shot.copy(awaitingCamera = false, errors = shot.errors + "上次拍摄未完成，请检查缺失文件") else shot
+                recoverShot(shot, "上次拍摄未完成，请检查缺失文件")
             })
         }
         return CaptureSession()
@@ -141,7 +149,8 @@ class SessionStore(private val root: File) {
             reliableIdentity = info?.reliableIdentity == true)
     }
     fun bind(info: PtpDeviceInfo) = update {
-        check(it.shots.isEmpty() || it.cameraIdentity == info.identity) { "本次记录属于另一台相机，请新建拍摄记录" }
+        check(it.shots.isEmpty() || it.cameraIdentity == info.identity ||
+            (it.cameraIdentity.isBlank() && it.shots.all { shot -> shot.phoneOnly })) { "本次记录属于另一台相机，请新建拍摄记录" }
         it.copy(cameraIdentity = info.identity, cameraName = "${info.manufacturer} ${info.model}", reliableIdentity = info.reliableIdentity)
     }
     fun add(shot: ShotRecord) = update { it.copy(shots = it.shots + shot) }
@@ -165,12 +174,16 @@ class SessionStore(private val root: File) {
     }?.sortedByDescending { it.createdMs }.orEmpty()
     fun select(id: String) {
         val selected = history().firstOrNull { it.id == id } ?: error("记录不存在")
-        update { selected.copy(shots = selected.shots.map { if (it.awaitingCamera) it.copy(awaitingCamera = false, errors = it.errors + "拍摄中断") else it }) }
+        update { selected.copy(shots = selected.shots.map { recoverShot(it, "拍摄中断") }) }
     }
+
+    private fun recoverShot(shot: ShotRecord, message: String): ShotRecord =
+        if (shot.awaitingCamera || (shot.phoneOnly && !shot.complete && shot.errors.isEmpty()))
+            shot.copy(awaitingCamera = false, errors = shot.errors + message) else shot
 
     fun archive(destination: File, allowIncomplete: Boolean): CaptureSession {
         val snapshot = current
-        check(snapshot.shots.isNotEmpty()) { "还没有同步拍摄记录" }
+        check(snapshot.shots.isNotEmpty()) { "还没有拍摄记录" }
         check(allowIncomplete || snapshot.shots.all { it.complete }) { "还有未完成的照片，请先补齐导入，或明确允许导出不完整记录" }
         val files = snapshot.shots.flatMap { shot ->
             shot.phone.map { Triple(it.path, it.size, it.sha256) } +
@@ -188,7 +201,7 @@ class SessionStore(private val root: File) {
                 zip.write(snapshot.json().toString(2).toByteArray())
                 zip.closeEntry()
                 zip.putNextEntry(ZipEntry("README.txt"))
-                zip.write("PairShot 同步拍摄记录\nphone/ 为手机照片，camera/ 为相机原片。\nmanifest.json 按 shot id 配对，包含 SHA-256、镜头、触发时间与缺失记录。\n相机带动手机为照片生成后的延迟联动；两台设备不保证同时曝光。\n".toByteArray())
+                zip.write("PairShot 拍摄记录\nphone/ 为手机照片，camera/ 为相机原片（仅联动模式）。\nPHONE_ONLY 为仅手机拍摄，不需要相机原片；每次拍摄按 shot id 归组。\nmanifest.json 包含 SHA-256、镜头标称物理焦距、请求变焦倍率、触发时间与缺失记录。标称焦距不是 35mm 等效焦距，变焦可能裁切或切换镜头。\n联动模式中，相机带动手机为照片生成后的延迟联动；两台设备不保证同时曝光。\n".toByteArray())
                 zip.closeEntry()
                 for ((path, _, _) in files.distinctBy { it.first }) {
                     zip.putNextEntry(ZipEntry(path))

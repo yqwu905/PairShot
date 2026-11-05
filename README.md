@@ -1,11 +1,18 @@
-# PairShot · Android 手机与尼康相机联动拍摄
+# PairShot · Android 手机多焦距与相机联动拍摄
 
 [![Android CI/CD](https://github.com/yqwu905/PairShot/actions/workflows/android.yml/badge.svg)](https://github.com/yqwu905/PairShot/actions/workflows/android.yml)
 [下载自动构建的 APK](https://github.com/yqwu905/PairShot/releases) · [CI/CD 与签名配置](docs/ci-cd.md)
 
-PairShot 是一个原生 Android 应用：手机通过 USB / OTG 数据线连接相机，使用 Camera2 拍摄手机照片，通过 PTP 控制/检测实体相机拍摄，复制本次配对的相机原片，最后导出一个 ZIP。
+PairShot 是一个原生 Android 应用：可以在“仅手机”模式使用手机镜头和变焦拍摄、导出照片 ZIP；也可以通过 USB / OTG 数据线连接相机，使用 Camera2 拍摄手机照片，通过 PTP 控制/检测实体相机拍摄，复制本次配对的相机原片，最后导出一个 ZIP。
 
-**当前版本 0.2.1，属于待实机验证的开发测试版。优先适配尼康，已有精确型号的扩展快门适配为 Z6 第一代。没有物理手机和相机接入本开发环境，不能将软件测试通过视为硬件兼容性确认。**
+**当前版本 0.3.0，属于待实机验证的开发测试版。联动模式优先适配尼康，已有精确型号的扩展快门适配为 Z6 第一代。没有物理手机和相机接入本开发环境，不能将软件测试通过视为硬件兼容性确认。**
+
+## 0.3.0 仅手机多焦距模式
+
+- 新增“仅手机”模式：只需手机摄像头权限，镜头就绪后可直接拍照，不需要外接相机、USB 授权、存储卡基线或开启联动。
+- 可切换系统开放的手机镜头，并使用所选逻辑相机声明的变焦范围；提供滑条和范围内的 0.5× / 1× / 2× / 3× / 5× 快捷按钮。Android 11+ 优先使用 Camera2 变焦倍率，Android 10 使用传感器中心裁切。物理镜头输出保留原生视角；不会为不支持的设备虚构超广角或光学变焦。
+- 每次拍摄独立归组，保存镜头标称物理焦距和请求变焦倍率。可换镜头或倍率后继续拍摄；支持硬件允许的双镜头组合，不自动轮拍所有焦距，也不保证双摄同时曝光。
+- 手机照片齐全即可完整打包 ZIP，保留历史和重启恢复；混合批次中的联动记录仍需相机原片齐全。USB Host 改为可选，仅相机联动需要 OTG。
 
 ## 0.2.1 连接修复
 
@@ -17,6 +24,7 @@ PairShot 是一个原生 Android 应用：手机通过 USB / OTG 数据线连接
 
 | 需求 | 当前实现 |
 | --- | --- |
+| 不连接相机的手机多焦距拍摄 | “仅手机”模式直接拍摄所选手机镜头，按硬件能力调节变焦；手机照片齐全即可归档，不要求相机原片 |
 | 使用不同手机摄像头 | 列出 Camera2 对第三方应用开放的前置、后置、逻辑相机及物理镜头；实时预览、切换镜头并拍摄 JPEG |
 | 手机多摄同时拍摄 | 最多选择两枚镜头。支持同一逻辑相机下的物理双摄输出；Android 11+ 也会检查 `concurrentCameraIds` 后尝试并发相机。只有实际成功建立会话的组合才显示就绪，双摄不保证同时曝光 |
 | 手机触发相机 | 手机按钮并行提交 Camera2 与 PTP 拍摄请求；Z6 使用尼康存储卡快门协议，其他机型仅在声明支持标准 `InitiateCapture` 时使用标准快门 |
@@ -36,13 +44,13 @@ PairShot 是一个原生 Android 应用：手机通过 USB / OTG 数据线连接
 
 ## 自动构建与发布
 
-`master` 更新后自动运行发布规则检查、Android 单元测试和 Lint，通过后发布可安装的测试 APK 到 [GitHub Releases](https://github.com/yqwu905/PairShot/releases)。PR 只验证和保存 Artifact。版本标签 `v0.2.1` 等会触发对应版本发布。
+`master` 更新后自动运行发布规则检查、Android 单元测试和 Lint，通过后发布可安装的测试 APK 到 [GitHub Releases](https://github.com/yqwu905/PairShot/releases)。PR 只验证和保存 Artifact。版本标签 `v0.3.0` 等会触发对应版本发布。
 
 默认使用缓存的调试签名，所有 Debug 包明确标记为预发布版；缓存被清理后签名可能变化，覆盖安装前需核对证书并先导出照片。正式签名可通过四个 GitHub Secrets 配置，细节见 [CI/CD 文档](docs/ci-cd.md)。
 
 ## 构建与安装
 
-- Android 10 / API 29 或以上；USB Host / OTG。
+- Android 10 / API 29 或以上；仅相机联动需要 USB Host / OTG。
 - JDK 21、Gradle 8.13（包含 Wrapper）。
 - Android SDK Platform 36，Build Tools 36.0.0。
 - Android Gradle Plugin 8.13.2、Kotlin 2.2.21、Jetpack Compose。
@@ -66,7 +74,17 @@ source /workspace/.pairshot-environment/env.sh
 
 `robolectricDependencyDir` 是只读/离线环境的可选测试配置，目录中需要相应 `android-all-instrumented` JAR。普通本地开发不用设置它。`work/` 是开发中间文件，不随源码交付。
 
-## 真机使用
+## 仅手机模式使用
+
+1. 安装 APK，选择顶部“仅手机”，授权手机摄像头；不需要连接任何 USB 设备。
+2. 选择系统开放的镜头。若要更换单镜头，先取消当前镜头再选择另一枚。双镜头只有系统声明支持且实际建立会话成功时可用；不支持时请使用单镜头。
+3. 镜头支持变焦时，用滑条或快捷按钮选择倍率，确认预览后点击“手机拍照”。切换镜头或倍率，再拍下一组。
+4. 点击“打包手机照片 ZIP”，在系统文件选择器中保存。手机模式完整记录无需勾选“允许导出不完整记录”；拍摄失败或丢失镜头照片仍会标记为不完整。
+5. 可通过“新建记录”另起批次，通过“历史记录”重新打开旧批次。仅手机与联动照片可以在同一批次中按不同 `mode` 保存；联动记录的相机导入要求仍然生效。
+
+界面 mm 是 Camera2 声明的镜头标称物理焦距，不是 35mm 等效焦距，也不是当次曝光测得的实际焦距；逻辑相机变焦可能使用数字裁切或切换物理镜头。倍率是请求值，不能视为纯光学变焦。系统未向第三方应用开放的超广角、长焦等镜头无法绕过限制调用。
+
+## USB 相机联动使用
 
 1. 在支持 OTG 的 Android 手机上安装 APK，打开应用并授权手机摄像头。应用无网络权限、不需要账号、不需要后端，也不申请全盘存储权限。
 2. 选择一枚手机镜头。系统未开放给第三方应用的镜头无法使用。如果选择双摄后初始化失败，取消其中一枚镜头再试。
@@ -90,7 +108,7 @@ phone/<shot-id>/<lens-key>.jpg
 camera/<shot-id>/<object-handle>_<original-filename>
 ```
 
-清单记录镜头、模式、触发墙钟时间、Android 单调时钟、手机图像时间戳、相机文件元数据、PTP 事务号、SHA-256、导入错误与完整性状态。
+清单记录镜头、模式、触发墙钟时间、Android 单调时钟、手机图像时间戳、相机文件元数据、PTP 事务号、SHA-256、导入错误与完整性状态。`mode = PHONE_ONLY` 的记录不期待相机文件，ZIP 可只包含手机照片和清单；每张新手机照片还记录 `nominalFocalLengthMm`（标称物理焦距，已知时）和 `requestedZoomRatio`（请求倍率）。旧版记录缺少这两个字段时仍可读取。
 
 手机图像时间戳只有在 `timestampSource = REALTIME` 时才与 `elapsedRealtimeNanos` 可比较；`UNKNOWN` 不可跨时钟相减。没有相机曝光时间戳，相机 `captureDate` 为未经校准的相机本地时间。清单中的触发时间也不能当作曝光同步误差。
 
@@ -127,6 +145,6 @@ camera/<shot-id>/<object-handle>_<original-filename>
 - `CameraViewModel.kt`：USB 生命周期、基线、联动、防反馈、配对、导入、历史记录和导出。
 - `MainActivity.kt`：中文 Compose 工作台、运行时权限、前台生命周期、系统 ZIP 保存。
 
-自动化检查覆盖 PTP 边界、Z6 指令路由、事件解析、RAW/JPEG 元数据、大文件分包传输、错误事务、记录恢复、导出完整性及无相机界面状态。测试报告位于 `app/build/reports/tests/testDebugUnitTest/`，Lint 报告位于 `app/build/reports/lint-results-debug.html`。
+自动化检查覆盖 PTP 边界、Z6 指令路由、事件解析、RAW/JPEG 元数据、大文件分包传输、错误事务、记录恢复、导出完整性、无相机界面状态，以及仅手机拍摄/倍率/失败/防重复触发/历史恢复和 Android 10 裁切范围。测试报告位于 `app/build/reports/tests/testDebugUnitTest/`，Lint 报告位于 `app/build/reports/lint-results-debug.html`。
 
-真机验收应覆盖：授权允许/拒绝、各镜头和双摄组合、两种拍摄模式、RAW+JPEG、相机忙/失焦、拔线、进后台、进程重启、重连导入、空间不足、保存 ZIP 后解压核对。自动化测试不替代这些硬件检查。
+真机验收应覆盖：仅手机模式无 USB 拍摄、各镜头和倍率的预览/成片一致性、双摄组合、授权允许/拒绝、两种联动方式、RAW+JPEG、相机忙/失焦、拔线、进后台、进程重启、重连导入、空间不足、保存 ZIP 后解压核对。自动化测试不替代这些硬件检查。

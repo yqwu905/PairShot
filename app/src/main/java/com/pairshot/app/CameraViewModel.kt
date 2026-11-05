@@ -10,12 +10,14 @@ import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.pairshot.app.data.CaptureSession
+import com.pairshot.app.data.PHONE_ONLY_MODE
 import com.pairshot.app.data.RemotePhoto
 import com.pairshot.app.data.SessionStore
 import com.pairshot.app.data.ShotRecord
 import com.pairshot.app.data.safeName
 import com.pairshot.app.data.sha256
 import com.pairshot.app.phone.PhoneCameraController
+import com.pairshot.app.phone.PhoneCamera
 import com.pairshot.app.ptp.PtpCodec
 import com.pairshot.app.ptp.PtpDeviceInfo
 import com.pairshot.app.ptp.PtpEvent
@@ -53,7 +55,13 @@ internal fun releasePtpSession(active: PtpSession) = ptpCleanup.submit {
     runCatching { active.close() }.onFailure { active.abort() }
 }
 
-enum class SyncMode { PHONE_LEADS, CAMERA_LEADS }
+enum class SyncMode { PHONE_LEADS, CAMERA_LEADS, PHONE_ONLY }
+
+private fun CaptureSession.captureMode(): SyncMode = when (shots.lastOrNull()?.mode) {
+    PHONE_ONLY_MODE -> SyncMode.PHONE_ONLY
+    "CAMERA_LEADS_POST_CAPTURE" -> SyncMode.CAMERA_LEADS
+    else -> SyncMode.PHONE_LEADS
+}
 
 data class CameraState(
     val devices: List<UsbDevice> = emptyList(), val connectedDeviceId: Int? = null,
@@ -74,11 +82,13 @@ class CameraViewModel @JvmOverloads constructor(
     private val permissionRequester: (UsbManager, UsbDevice, PendingIntent) -> Unit = { manager, device, pending ->
         manager.requestPermission(device, pending)
     },
+    phoneFactory: (Application, SessionStore) -> PhoneCamera = { app, store -> PhoneCameraController(app, store) },
 ) : AndroidViewModel(application) {
     private val manager = application.getSystemService(UsbManager::class.java)
     val store = SessionStore(File(application.filesDir, "sessions"))
-    val phone = PhoneCameraController(application, store)
-    private val mutable = MutableStateFlow(CameraState())
+    val phone = phoneFactory(application, store)
+    private val mutable = MutableStateFlow(CameraState(mode = store.current.captureMode(),
+        status = if (store.current.captureMode() == SyncMode.PHONE_ONLY) "仅手机模式 · 选择镜头和倍率即可拍摄" else "连接相机，开始双端拍摄"))
     val state = mutable.asStateFlow()
     private var session: PtpSession? = null
     private var sessionDeviceId: Int? = null
@@ -129,7 +139,7 @@ class CameraViewModel @JvmOverloads constructor(
         }
     }
     fun requestConnection(device: UsbDevice) {
-        if (mutable.value.busy || session != null || permissionDevice != null) return
+        if (mutable.value.mode == SyncMode.PHONE_ONLY || mutable.value.busy || session != null || permissionDevice != null) return
         if (manager.hasPermission(device)) connect(device) else {
             val context = getApplication<Application>()
             // An immutable PendingIntent cannot rely on system fill-in extras.
@@ -204,10 +214,15 @@ class CameraViewModel @JvmOverloads constructor(
         if (mutable.value.busy || mutable.value.shooting || mutable.value.waitingCamera) return
         stopSync()
         mutable.update { it.copy(mode = mode) }
+        status(if (mode == SyncMode.PHONE_ONLY) "仅手机模式 · 选择镜头和倍率即可拍摄" else "选择镜头并连接相机后开启联动")
     }
     fun toggleLens(key: String) {
         if (mutable.value.busy || mutable.value.shooting || mutable.value.waitingCamera) return
         stopSync(); phone.toggle(key)
+    }
+    fun setZoom(key: String, ratio: Float) {
+        if (mutable.value.busy || mutable.value.shooting || mutable.value.waitingCamera) return
+        stopSync(); phone.setZoom(key, ratio)
     }
     fun onForeground(value: Boolean) {
         foreground = value
@@ -217,6 +232,7 @@ class CameraViewModel @JvmOverloads constructor(
     }
 
     fun arm() {
+        if (mutable.value.mode == SyncMode.PHONE_ONLY) return
         val active = session ?: return
         val info = mutable.value.info ?: return
         if (mutable.value.busy || mutable.value.armed || mutable.value.shooting) return
@@ -306,6 +322,7 @@ class CameraViewModel @JvmOverloads constructor(
     }
 
     internal suspend fun onCameraPhoto(info: PtpObjectInfo, event: PtpEvent) {
+        if (mutable.value.mode == SyncMode.PHONE_ONLY) return
         val groupKey = "${info.groupKey}/${info.captureDate}"
         var shotId = cameraGroups[groupKey]
         if (mutable.value.mode == SyncMode.PHONE_LEADS && shotId == null) {
@@ -349,6 +366,7 @@ class CameraViewModel @JvmOverloads constructor(
     }
 
     fun capture() {
+        if (mutable.value.mode == SyncMode.PHONE_ONLY) { capturePhoneOnly(); return }
         val active = session ?: return
         if (!mutable.value.armed || mutable.value.mode != SyncMode.PHONE_LEADS || mutable.value.busy || mutable.value.shooting || pending != null || !phone.state.value.ready) return
         val captureGeneration = generation
@@ -392,6 +410,35 @@ class CameraViewModel @JvmOverloads constructor(
                 if (pending?.id == shot.id) { pending = null; mutable.update { it.copy(waitingCamera = false) } }
                 withContext(Dispatchers.IO) { runCatching { store.shot(shot.id) { it.copy(awaitingCamera = false, errors = it.errors + "拍摄流程中断：${error.message}") } } }
                 status("拍摄流程中断：${error.message}")
+            } finally { mutable.update { it.copy(shooting = false) } }
+        }
+    }
+
+    private fun capturePhoneOnly() {
+        val state = mutable.value
+        val camera = phone.state.value
+        if (!foreground || state.busy || state.shooting || state.waitingCamera ||
+            !camera.permission || !camera.ready || camera.capturing || camera.selected.isEmpty()) return
+        val shot = ShotRecord(mode = PHONE_ONLY_MODE, triggerElapsedNs = SystemClock.elapsedRealtimeNanos(),
+            lenses = camera.selected.toList())
+        mutable.update { it.copy(shooting = true) }
+        status("正在拍摄手机照片…")
+        viewModelScope.launch {
+            var recorded = false
+            try {
+                withContext(Dispatchers.IO) { store.add(shot) }
+                recorded = true
+                check(foreground && mutable.value.mode == SyncMode.PHONE_ONLY) { "拍摄请求在发送前已取消" }
+                phone.capture(shot.id)
+                check(store.current.shots.first { it.id == shot.id }.complete) { "未保存所有选中镜头的照片" }
+                status("已保存 ${camera.selected.size} 张手机照片，可继续拍摄或打包 ZIP")
+            } catch (error: Exception) {
+                if (recorded) withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                    runCatching { store.shot(shot.id) { it.copy(errors = it.errors + "手机拍摄：${error.message ?: "拍摄中断"}") } }
+                        .onFailure { status("记录保存失败：${it.message}") }
+                }
+                status("手机拍摄失败：${error.message ?: "拍摄中断"}")
+                if (error is CancellationException) throw error
             } finally { mutable.update { it.copy(shooting = false) } }
         }
     }
@@ -443,7 +490,7 @@ class CameraViewModel @JvmOverloads constructor(
         mutable.update { it.copy(busy = true) }
         viewModelScope.launch {
             try {
-                withContext(Dispatchers.IO) { store.newSession(mutable.value.info) }
+                withContext(Dispatchers.IO) { store.newSession(if (mutable.value.mode == SyncMode.PHONE_ONLY) null else mutable.value.info) }
                 status("已新建拍摄记录；以前的记录保存在历史记录中")
             } catch (error: Exception) { status("新建记录失败：${error.message}") }
             finally { mutable.update { it.copy(busy = false) } }
@@ -455,7 +502,12 @@ class CameraViewModel @JvmOverloads constructor(
         stopSync()
         mutable.update { it.copy(busy = true) }
         viewModelScope.launch {
-            try { withContext(Dispatchers.IO) { store.select(id) } }
+            try {
+                withContext(Dispatchers.IO) { store.select(id) }
+                val mode = store.current.captureMode()
+                mutable.update { it.copy(mode = mode) }
+                status(if (mode == SyncMode.PHONE_ONLY) "已打开仅手机拍摄记录，可直接继续拍摄或导出" else "已打开联动拍摄记录")
+            }
             catch (error: Exception) { status("读取历史记录失败：${error.message}") }
             finally { mutable.update { it.copy(busy = false) } }
         }
@@ -546,7 +598,7 @@ class CameraViewModel @JvmOverloads constructor(
                     val resolver = getApplication<Application>().contentResolver
                     checkNotNull(resolver.openOutputStream(uri, "w")) { "无法打开保存位置" }.use { output -> File(path).inputStream().use { it.copyTo(output, 64 * 1024) } }
                 }
-                status("ZIP 已保存，包含手机照片、相机原片与配对清单")
+                status("ZIP 已保存，包含本次照片与拍摄清单")
             } catch (error: Exception) { status("ZIP 保存失败：${error.message}，请重新打包保存") }
             finally { File(path).delete(); mutable.update { it.copy(busy = false) } }
         }

@@ -81,6 +81,80 @@ class SessionStoreTest {
         store.select(first.id)
         assertEquals(first.shots, store.current.shots)
     }
+    @Test fun phoneOnlyArchiveIsCompleteWithoutCameraAndKeepsFocalMetadata() {
+        val store = SessionStore(temp.newFolder())
+        val photos = listOf(phonePhoto(store, "0", 1f), phonePhoto(store, "1", 2f))
+        store.add(ShotRecord(id = "phone", mode = PHONE_ONLY_MODE, triggerElapsedNs = 100,
+            lenses = listOf("0", "1"), phone = photos))
+        assertTrue(store.current.shots.single().complete)
+        assertFalse(store.current.shots.single().awaitingCamera)
+        val zip = File(temp.root, "phone-only.zip")
+        store.archive(zip, false)
+        ZipFile(zip).use { archive ->
+            val names = archive.entries().asSequence().map { it.name }.toSet()
+            assertEquals(setOf("manifest.json", "README.txt", "phone/phone/0.jpg", "phone/phone/1.jpg"), names)
+            val manifest = JSONObject(archive.getInputStream(archive.getEntry("manifest.json")).bufferedReader().readText())
+            val shot = manifest.getJSONArray("shots").getJSONObject(0)
+            assertEquals(PHONE_ONLY_MODE, shot.getString("mode"))
+            assertTrue(shot.getBoolean("complete"))
+            assertEquals(0, shot.getJSONArray("camera").length())
+            val restored = CaptureSession.from(manifest).shots.single()
+            assertEquals(photos, restored.phone)
+            assertEquals(2f, restored.phone[1].requestedZoomRatio)
+            assertEquals(4.2f, restored.phone[1].nominalFocalLengthMm)
+        }
+    }
+    @Test fun missingOrDuplicatePhoneLensesCannotSatisfyCompletePhoneOnlyRecord() {
+        val store = SessionStore(temp.newFolder())
+        val photo = phonePhoto(store, "0", 1f)
+        val shot = ShotRecord(id = "phone", mode = PHONE_ONLY_MODE, triggerElapsedNs = 100,
+            lenses = listOf("0", "1"), phone = listOf(photo))
+        assertFalse(shot.complete)
+        assertFalse(shot.copy(phone = listOf(photo, photo)).complete)
+        store.add(shot)
+        assertThrows(IllegalStateException::class.java) { store.archive(File(temp.root, "missing.zip"), false) }
+    }
+    @Test fun phoneOnlyRecoveryPreservesFinishedPhotosAndMarksInterruptedCapture() {
+        val directory = temp.newFolder()
+        val store = SessionStore(directory)
+        store.add(ShotRecord(id = "phone", mode = PHONE_ONLY_MODE, triggerElapsedNs = 100,
+            lenses = listOf("0"), phone = listOf(phonePhoto(store, "0", 2f))))
+        store.add(ShotRecord(id = "interrupted", mode = PHONE_ONLY_MODE, triggerElapsedNs = 200, lenses = listOf("1")))
+        val recovered = SessionStore(directory).current.shots
+        assertTrue(recovered[0].complete)
+        assertTrue(recovered[0].errors.isEmpty())
+        assertFalse(recovered[1].complete)
+        assertFalse(recovered[1].awaitingCamera)
+        assertTrue(recovered[1].errors.isNotEmpty())
+    }
+    @Test fun phoneOnlyBatchCanLaterBindItsFirstCameraButCannotChangeIdentity() {
+        val store = SessionStore(temp.newFolder())
+        store.add(ShotRecord(mode = PHONE_ONLY_MODE, triggerElapsedNs = 100, lenses = listOf("0")))
+        val camera = PtpDeviceInfo("Nikon", "Z6", "1", emptySet(), 10, identity = "first")
+        store.bind(camera)
+        assertEquals("first", store.current.cameraIdentity)
+        assertThrows(IllegalStateException::class.java) { store.bind(camera.copy(identity = "other")) }
+    }
+    @Test fun phoneOnlyRowsDoNotMakeMissingLinkedCameraFilesComplete() {
+        val store = completeStore()
+        store.add(ShotRecord(id = "phone", mode = PHONE_ONLY_MODE, triggerElapsedNs = 200,
+            lenses = listOf("0"), phone = listOf(phonePhoto(store, "0", 2f))))
+        store.shot("shot") { it.copy(camera = emptyList()) }
+        assertTrue(store.current.shots.last().complete)
+        assertFalse(store.current.shots.first().complete)
+        assertThrows(IllegalStateException::class.java) { store.archive(File(temp.root, "mixed.zip"), false) }
+    }
+    @Test fun legacyPhotosWithoutFocalMetadataStillLoad() {
+        val photo = PhonePhoto("0", "后置", "phone/shot/0.jpg", 3, "hash", 100, "UNKNOWN", 120, 160)
+        val legacy = photo.json().apply { remove("nominalFocalLengthMm"); remove("requestedZoomRatio") }
+        assertEquals(photo, PhonePhoto.from(legacy))
+    }
+    private fun phonePhoto(store: SessionStore, lens: String, zoom: Float): PhonePhoto {
+        val path = "phone/phone/$lens.jpg"
+        val file = store.file(path).apply { parentFile!!.mkdirs(); writeBytes(byteArrayOf(1, 2, 3)) }
+        return PhonePhoto(lens, "后置 $lens", path, file.length(), sha256(file), 100, "UNKNOWN", 120, 160,
+            nominalFocalLengthMm = 4.2f, requestedZoomRatio = zoom)
+    }
     private fun completeStore(): SessionStore {
         val store = SessionStore(temp.newFolder())
         val phonePath = "phone/shot/lens.jpg"

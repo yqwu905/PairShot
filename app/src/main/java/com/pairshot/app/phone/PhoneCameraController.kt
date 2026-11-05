@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.graphics.Matrix
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
@@ -45,6 +46,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import java.io.Closeable
@@ -55,14 +57,36 @@ import kotlin.coroutines.resumeWithException
 data class PhoneLens(
     val key: String, val cameraId: String, val physicalId: String?, val label: String,
     val focalLength: Float, val front: Boolean,
+    val minZoom: Float = 1f, val maxZoom: Float = 1f, val zoomRatioControl: Boolean = false,
 )
 data class PhoneState(
     val permission: Boolean = false, val lenses: List<PhoneLens> = emptyList(), val selected: List<String> = emptyList(),
     val ready: Boolean = false, val capturing: Boolean = false, val message: String = "请授权手机摄像头",
+    val zoomRatios: Map<String, Float> = emptyMap(),
 )
 
+interface PhoneCamera : Closeable {
+    val state: StateFlow<PhoneState>
+    fun refresh()
+    fun toggle(key: String)
+    fun setZoom(key: String, ratio: Float)
+    fun attach(key: String, view: TextureView)
+    fun detach(key: String, view: TextureView)
+    fun setRunning(value: Boolean)
+    suspend fun capture(shotId: String): List<PhonePhoto>
+}
+
+internal fun zoomCropRegion(active: Rect, ratio: Float): Rect {
+    require(ratio.isFinite() && ratio >= 1f)
+    val width = (active.width() / ratio).toInt().coerceAtLeast(1)
+    val height = (active.height() / ratio).toInt().coerceAtLeast(1)
+    val left = active.left + (active.width() - width) / 2
+    val top = active.top + (active.height() - height) / 2
+    return Rect(left, top, left + width, top + height)
+}
+
 /** Prepared Camera2 sessions. Logical physical cameras and declared concurrent sets only. */
-class PhoneCameraController(private val context: Context, private val store: SessionStore) : Closeable {
+class PhoneCameraController(private val context: Context, private val store: SessionStore) : PhoneCamera {
     private val manager = context.getSystemService(CameraManager::class.java)
     private val thread = HandlerThread("PairShot-Camera2").apply { start() }
     private val handler = Handler(thread.looper)
@@ -71,7 +95,7 @@ class PhoneCameraController(private val context: Context, private val store: Ses
     private val executor = Executor { handler.post(it) }
     private val mutex = Mutex()
     private val mutable = MutableStateFlow(PhoneState())
-    val state = mutable.asStateFlow()
+    override val state = mutable.asStateFlow()
     private val previews = mutableMapOf<String, TextureView>()
     private var running = false
     private var configureJob: Job? = null
@@ -81,9 +105,10 @@ class PhoneCameraController(private val context: Context, private val store: Ses
 
     private data class LensOutput(val lens: PhoneLens, val reader: ImageReader, val preview: Surface)
     private data class Group(val device: CameraDevice, val session: CameraCaptureSession, val outputs: List<LensOutput>)
-    private data class Pending(val id: String, val deferred: CompletableDeferred<PhonePhoto>, val requestedNs: Long, var sensorNs: Long = 0)
+    private data class Pending(val id: String, val deferred: CompletableDeferred<PhonePhoto>, val requestedNs: Long,
+        val zoomRatio: Float, var sensorNs: Long = 0)
 
-    fun refresh() {
+    override fun refresh() {
         val permission = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
         if (!permission) { mutable.update { it.copy(permission = false, ready = false) }; return }
         try {
@@ -93,7 +118,14 @@ class PhoneCameraController(private val context: Context, private val store: Ses
                 val front = chars[CameraCharacteristics.LENS_FACING] == CameraCharacteristics.LENS_FACING_FRONT
                 val focal = chars[CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS]?.firstOrNull() ?: 0f
                 val side = if (front) "前置" else "后置"
-                list += PhoneLens(id, id, null, "$side · 相机 $id · ${"%.1f".format(focal)} mm", focal, front)
+                val zoomRange = if (Build.VERSION.SDK_INT >= 30) chars[CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE] else null
+                val ratioControl = zoomRange != null && zoomRange.lower.isFinite() && zoomRange.lower > 0f &&
+                    zoomRange.upper.isFinite() && zoomRange.upper >= zoomRange.lower
+                val minZoom = if (ratioControl) checkNotNull(zoomRange).lower else 1f
+                val maxZoom = if (ratioControl) checkNotNull(zoomRange).upper else
+                    (chars[CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM] ?: 1f).takeIf { it.isFinite() && it >= 1f } ?: 1f
+                list += PhoneLens(id, id, null, "$side · 相机 $id · ${"%.1f".format(focal)} mm", focal, front,
+                    minZoom, maxZoom, ratioControl)
                 for (physical in chars.physicalCameraIds.sorted()) {
                     val pc = manager.getCameraCharacteristics(physical)
                     val pf = pc[CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS]?.firstOrNull() ?: 0f
@@ -102,15 +134,17 @@ class PhoneCameraController(private val context: Context, private val store: Ses
             }
             val selected = mutable.value.selected.filter { key -> list.any { it.key == key } }
                 .ifEmpty { list.firstOrNull { !it.front && it.physicalId == null }?.let { listOf(it.key) } ?: list.take(1).map { it.key } }
-            mutable.update { it.copy(permission = true, lenses = list, selected = selected, message = "选择一枚镜头；可在硬件支持时同时选择两枚") }
+            mutable.update { old -> old.copy(permission = true, lenses = list, selected = selected,
+                zoomRatios = list.associate { it.key to (old.zoomRatios[it.key] ?: 1f).coerceIn(it.minZoom, it.maxZoom) },
+                message = "选择镜头与变焦倍率；可在硬件支持时同时选择两枚") }
             reconfigure()
         } catch (error: Exception) {
             mutable.update { it.copy(permission = true, message = error.message ?: "无法读取手机镜头") }
         }
     }
 
-    fun toggle(key: String) {
-        if (mutable.value.capturing) return
+    override fun toggle(key: String) {
+        if (mutable.value.capturing || mutable.value.lenses.none { it.key == key }) return
         val selected = mutable.value.selected.toMutableList()
         if (key in selected) selected.remove(key) else {
             if (selected.size >= 2) { mutable.update { it.copy(message = "当前版本最多同时使用两枚手机镜头") }; return }
@@ -123,6 +157,23 @@ class PhoneCameraController(private val context: Context, private val store: Ses
         reconfigure()
     }
 
+    override fun setZoom(key: String, ratio: Float) {
+        if (closed || mutable.value.capturing || !ratio.isFinite() || key !in mutable.value.selected) return
+        val lens = mutable.value.lenses.firstOrNull { it.key == key && it.physicalId == null } ?: return
+        val value = ratio.coerceIn(lens.minZoom, lens.maxZoom)
+        if (value == mutable.value.zoomRatios[key]) return
+        mutable.update { it.copy(zoomRatios = it.zoomRatios + (key to value)) }
+        scope.launch {
+            mutex.withLock {
+                try { groups.forEach(::updatePreview) }
+                catch (error: Exception) {
+                    releaseGroups()
+                    mutable.update { it.copy(message = "变焦设置失败：${error.message}，请重新选择镜头") }
+                }
+            }
+        }
+    }
+
     private fun combinationProblem(lenses: List<PhoneLens>): String? {
         if (lenses.size < 2) return null
         if (lenses.map { it.cameraId }.distinct().size == 1) {
@@ -133,15 +184,15 @@ class PhoneCameraController(private val context: Context, private val store: Ses
         return if (manager.concurrentCameraIds.any { it.containsAll(ids) }) null else "系统未声明这组镜头可以同时工作，请逐个选择拍摄"
     }
 
-    fun attach(key: String, view: TextureView) {
+    override fun attach(key: String, view: TextureView) {
         synchronized(previews) { previews[key] = view }
         reconfigure()
     }
-    fun detach(key: String, view: TextureView) {
+    override fun detach(key: String, view: TextureView) {
         synchronized(previews) { if (previews[key] === view) previews.remove(key) }
         reconfigure()
     }
-    fun setRunning(value: Boolean) {
+    override fun setRunning(value: Boolean) {
         running = value
         if (value && !mutable.value.permission) refresh()
         reconfigure()
@@ -179,13 +230,7 @@ class PhoneCameraController(private val context: Context, private val store: Ses
                             throw error
                         }
                     }
-                    for (group in groups) {
-                        val request = group.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                            group.outputs.forEach { addTarget(it.preview) }
-                            autoControls(this, group.device.id)
-                        }
-                        group.session.setRepeatingRequest(request.build(), null, handler)
-                    }
+                    groups.forEach(::updatePreview)
                     mutable.update { it.copy(ready = true, message = if (selected.size > 1) "双镜头已就绪 · 实际曝光差异受手机硬件影响" else "手机镜头已就绪") }
                 } catch (error: Exception) {
                     releaseGroups()
@@ -262,7 +307,30 @@ class PhoneCameraController(private val context: Context, private val store: Ses
         if (CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE in modes) request.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
     }
 
-    suspend fun capture(shotId: String): List<PhonePhoto> = withContext(handler.asCoroutineDispatcher()) {
+    private fun zoomControls(request: CaptureRequest.Builder, group: Group) {
+        val lens = group.outputs.singleOrNull()?.lens ?: return
+        // Physical outputs retain their native view. A logical zoom ratio must
+        // never be applied to a pair of separately routed physical outputs.
+        if (lens.physicalId != null) return
+        val ratio = (mutable.value.zoomRatios[lens.key] ?: 1f).coerceIn(lens.minZoom, lens.maxZoom)
+        if (Build.VERSION.SDK_INT >= 30 && lens.zoomRatioControl) {
+            request.set(CaptureRequest.CONTROL_ZOOM_RATIO, ratio)
+        } else if (lens.maxZoom > 1f) {
+            val active = checkNotNull(manager.getCameraCharacteristics(lens.cameraId)[CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE])
+            request.set(CaptureRequest.SCALER_CROP_REGION, zoomCropRegion(active, ratio))
+        }
+    }
+
+    private fun updatePreview(group: Group) {
+        val request = group.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+            group.outputs.forEach { addTarget(it.preview) }
+            autoControls(this, group.device.id)
+            zoomControls(this, group)
+        }
+        group.session.setRepeatingRequest(request.build(), null, handler)
+    }
+
+    override suspend fun capture(shotId: String): List<PhonePhoto> = withContext(handler.asCoroutineDispatcher()) {
         mutex.withLock {
             check(mutable.value.ready && groups.isNotEmpty()) { "手机镜头尚未就绪" }
             mutable.update { it.copy(capturing = true) }
@@ -271,7 +339,7 @@ class PhoneCameraController(private val context: Context, private val store: Ses
                 val waiters = groups.flatMap { it.outputs }.associate { output ->
                     while (true) { val old = output.reader.acquireLatestImage() ?: break; old.close() }
                     val result = CompletableDeferred<PhonePhoto>()
-                    pending[output.lens.key] = Pending(shotId, result, requested)
+                    pending[output.lens.key] = Pending(shotId, result, requested, mutable.value.zoomRatios[output.lens.key] ?: 1f)
                     output.lens.key to result
                 }
                 for (group in groups) {
@@ -283,6 +351,7 @@ class PhoneCameraController(private val context: Context, private val store: Ses
                     val request = group.device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                         group.outputs.forEach { addTarget(it.reader.surface) }
                         autoControls(this, group.device.id)
+                        zoomControls(this, group)
                         set(CaptureRequest.JPEG_ORIENTATION, (sensor + (if (front) degrees else -degrees) + 360) % 360)
                         set(CaptureRequest.JPEG_QUALITY, 95.toByte())
                     }
@@ -344,7 +413,8 @@ class PhoneCameraController(private val context: Context, private val store: Ses
                 partial.outputStream().use { it.write(bytes); it.flush() }
                 check(partial.renameTo(file)) { "无法保存手机照片" }
                 val photo = PhonePhoto(lens.key, lens.label, path, file.length(), sha256(file), timestamp,
-                    if (sourceType == CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME) "REALTIME" else "UNKNOWN", request.requestedNs, callback)
+                    if (sourceType == CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME) "REALTIME" else "UNKNOWN", request.requestedNs, callback,
+                    lens.focalLength.takeIf { it.isFinite() && it > 0f }, request.zoomRatio)
                 store.shot(request.id) { it.copy(phone = it.phone.filterNot { existing -> existing.lens == lens.key } + photo) }
                 request.deferred.complete(photo)
             } catch (error: Exception) { partial?.delete(); request.deferred.completeExceptionally(error) }
