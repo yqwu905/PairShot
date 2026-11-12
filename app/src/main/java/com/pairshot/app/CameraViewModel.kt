@@ -65,7 +65,7 @@ private fun CaptureSession.captureMode(): SyncMode = when (shots.lastOrNull()?.m
 
 data class CameraState(
     val devices: List<UsbDevice> = emptyList(), val connectedDeviceId: Int? = null,
-    val info: PtpDeviceInfo? = null, val status: String = "连接相机，开始双端拍摄",
+    val info: PtpDeviceInfo? = null, val status: String = "待连接相机",
     val connectionMessage: String = "尚未连接相机会话",
     val permissionDeviceId: Int? = null,
     val busy: Boolean = false, val armed: Boolean = false, val shooting: Boolean = false,
@@ -88,7 +88,7 @@ class CameraViewModel @JvmOverloads constructor(
     val store = SessionStore(File(application.filesDir, "sessions"))
     val phone = phoneFactory(application, store)
     private val mutable = MutableStateFlow(CameraState(mode = store.current.captureMode(),
-        status = if (store.current.captureMode() == SyncMode.PHONE_ONLY) "仅手机模式 · 选择镜头和倍率即可拍摄" else "连接相机，开始双端拍摄"))
+        status = if (store.current.captureMode() == SyncMode.PHONE_ONLY) "仅手机模式" else "待连接相机"))
     val state = mutable.asStateFlow()
     private var session: PtpSession? = null
     private var sessionDeviceId: Int? = null
@@ -214,7 +214,7 @@ class CameraViewModel @JvmOverloads constructor(
         if (mutable.value.busy || mutable.value.shooting || mutable.value.waitingCamera) return
         stopSync()
         mutable.update { it.copy(mode = mode) }
-        status(if (mode == SyncMode.PHONE_ONLY) "仅手机模式 · 选择镜头和倍率即可拍摄" else "选择镜头并连接相机后开启联动")
+        status(if (mode == SyncMode.PHONE_ONLY) "仅手机模式" else "相机联动")
     }
     fun toggleLens(key: String) {
         if (mutable.value.busy || mutable.value.shooting || mutable.value.waitingCamera) return
