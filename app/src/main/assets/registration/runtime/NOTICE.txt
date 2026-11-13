@@ -1,0 +1,14 @@
+Browser computation runtime
+
+Unmodified Pyodide 0.29.4 files and its pinned NumPy 2.2.5, OpenCV-Python
+4.11.0.86, and Pillow 11.3.0 packages are distributed alongside this site.
+
+Runtime source: https://github.com/pyodide/pyodide/tree/0.29.4
+Distribution: https://cdn.jsdelivr.net/pyodide/v0.29.4/full/
+Package manifest: pyodide-lock.json (upstream package hashes retained).
+Pyodide license: Mozilla Public License 2.0; see PYODIDE-LICENSE.txt.
+Each wheel retains its complete original license and third-party notices.
+CPython 3.13.2 license: CPYTHON-LICENSE.txt.
+Complete combined package notices: THIRD_PARTY_LICENSES.txt.
+
+These files run in the visitor's browser. They do not upload input image bytes.

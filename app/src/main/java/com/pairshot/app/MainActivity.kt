@@ -134,6 +134,9 @@ internal fun CameraScreen(model: CameraViewModel = viewModel()) {
                 horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.End)) {
                 CompactChoice("仅手机", phoneOnly, !locked, Modifier.testTag("mode_phone_only")) { model.setMode(SyncMode.PHONE_ONLY) }
                 CompactChoice("相机联动", !phoneOnly, !locked) { model.setMode(SyncMode.PHONE_LEADS) }
+                CompactChoice("配准工具", false, !locked, Modifier.testTag("registration_tool")) {
+                    context.startActivity(Intent(context, com.pairshot.app.registration.RegistrationActivity::class.java))
+                }
             }
         }
     }) { padding ->

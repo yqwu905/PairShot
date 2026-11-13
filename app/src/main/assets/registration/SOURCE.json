@@ -1,0 +1,12 @@
+{
+  "site_project_id": "appgprj_6af56e3ddba48191886b820053053282",
+  "source_commit": "aae4dd28cedad114e299547f522a568d34881bd3",
+  "algorithm_version": "color-v2",
+  "pyodide": "0.29.4",
+  "algorithm_sha256": {
+    "engine.py": "87bf9719e3c92f161a237ffb9bf53f9999abfa51a5817bb938098ce33abebb86",
+    "color_global.py": "211878c0c69af038543271cb247fcf3b3b339492cfd6a87020914605a872ef2e",
+    "color_local.py": "185dd01a59672eda5fbfe124bcc3f6803077c231c275d837fd33c9563bccae3e"
+  },
+  "notes": "Algorithm modules and bundled runtime are copied unchanged from the source Site. Android uses a local WebView worker and native input/result storage; no computation service is contacted."
+}

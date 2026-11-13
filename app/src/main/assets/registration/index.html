@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b1011">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>PairShot 配准工具</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<main>
+  <div class="page-intro"><span class="local-mark"><i></i>本机离线计算</span><button id="helpBtn" class="quiet">使用说明</button></div>
+  <div class="workspace">
+    <div class="setup">
+      <section class="panel inputs">
+        <div class="section-head"><h1>选择两张照片</h1><button id="swapBtn" class="quiet" disabled>交换 ⇄</button></div>
+        <div class="image-pair">
+          <article class="input-card" id="mainDrop">
+            <h2>待配准图</h2><p class="role-note">移动并调整颜色的照片</p>
+            <div class="input-thumb"><img id="mainThumb" alt="待配准照片预览" hidden><span id="mainPlaceholder">尚未选择</span></div>
+            <div id="mainName" class="filename">选择拍摄记录或手机文件</div><div id="mainMeta" class="input-meta">JPEG · PNG · WebP</div>
+            <div class="pick-actions"><button data-pick="main" data-source="library">拍摄记录</button><button data-pick="main" data-source="device">手机文件</button></div>
+            <input id="mainFile" type="file" accept="image/jpeg,image/png,image/webp" hidden>
+          </article>
+          <article class="input-card" id="teleDrop">
+            <h2>参考图</h2><p class="role-note">作为位置和颜色的目标</p>
+            <div class="input-thumb"><img id="teleThumb" alt="参考照片预览" hidden><span id="telePlaceholder">尚未选择</span></div>
+            <div id="teleName" class="filename">选择拍摄记录或手机文件</div><div id="teleMeta" class="input-meta">JPEG · PNG · WebP</div>
+            <div class="pick-actions"><button data-pick="tele" data-source="library">拍摄记录</button><button data-pick="tele" data-source="device">手机文件</button></div>
+            <input id="teleFile" type="file" accept="image/jpeg,image/png,image/webp" hidden>
+          </article>
+        </div>
+        <p id="importStatus" class="small-note" role="status" hidden>正在导入图片…</p>
+      </section>
+      <section class="panel settings">
+        <div class="settings-row">
+          <label for="resolution">结果长边<select id="resolution"><option value="1024" selected>1024 px · 推荐</option><option value="1440">1440 px</option><option value="1920">1920 px · 较慢</option></select></label>
+          <label class="switch-row" for="localColor"><span>增强颜色对齐<small>补偿局部亮度与色差</small></span><input id="localColor" type="checkbox" checked></label>
+        </div>
+        <button id="runBtn" class="primary" disabled>开始配准</button>
+        <p class="small-note">原图保持不变。较高分辨率会增加耗时与内存占用。</p>
+        <section id="progressPanel" hidden aria-live="polite">
+          <div class="progress-heading"><strong id="progressLabel">准备计算</strong><span id="progressPercent">0%</span></div>
+          <progress id="progressBar" max="100" value="0"></progress><p id="progressDetail" class="small-note"></p>
+          <button id="cancelBtn" class="danger">取消计算</button>
+        </section>
+      </section>
+    </div>
+    <div class="results-column">
+      <section id="errorPanel" class="error-panel" role="alert" hidden><div><strong>未能完成操作</strong><p id="errorText"></p></div><button id="dismissError" aria-label="关闭错误提示">×</button></section>
+      <section id="viewerPanel" class="panel viewer-panel">
+        <div class="viewer-header"><h2>结果对比</h2><span id="resultBadge" class="badge">等待选图</span><span id="outputSize" class="output-size"></span></div>
+        <div id="emptyView" class="empty-view"><span class="empty-icon">⇄</span><h3>对齐同一场景的两张照片</h3><p>先选待配准图和参考图，再开始计算。<br>参考图保持不变，结果与参考图尺寸一致。</p></div>
+        <div id="canvasView" class="canvas-view" hidden>
+          <canvas id="viewer" aria-label="配准结果与参考图对比"></canvas>
+          <span id="leftLabel" class="image-tag left">配准结果</span><span id="rightLabel" class="image-tag right">参考图</span>
+          <div id="splitHandle" class="split-handle" role="slider" tabindex="0" aria-label="对比分界线" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"><span>‹ ›</span></div>
+          <span id="viewRotation" class="rotation-note" hidden></span>
+        </div>
+        <div id="resultControls" hidden>
+          <div class="viewer-toolbar"><div class="mode-tabs" role="group" aria-label="对比方式"><button data-mode="split" class="active">滑动</button><button data-mode="blend">叠加</button><button data-mode="diff">差异 ×4</button></div><div class="zoom-tools"><button id="zoomOut" aria-label="缩小">−</button><button id="zoomLabel" title="恢复适应大小">适应</button><button id="zoomIn" aria-label="放大">＋</button><button id="rotateBtn" aria-label="顺时针旋转视图">↻</button></div></div>
+          <div class="stage-row"><label for="stageSelect">处理阶段<select id="stageSelect"><option value="aligned">最终结果</option><option value="global">几何 + 全局调色</option><option value="geometry">仅稠密几何</option><option value="homography">仅全局透视</option></select></label><label class="mask-label"><input id="maskToggle" type="checkbox">标出不可靠区域</label></div>
+          <input id="splitRange" type="range" min="0" max="100" value="50" aria-label="结果显示比例">
+          <p id="canvasHint" class="small-note centered">滑动分界线对比 · 双指缩放 · 拖动平移</p>
+        </div>
+      </section>
+      <section id="metricsPanel" class="panel metrics" hidden>
+        <div><span>几何筛选面积</span><strong id="metricArea">—</strong><small>通过比例不是准确率</small></div><div><span>低频颜色误差</span><strong id="metricColor">—</strong><small id="metricTrusted">拟合后的对比指标</small></div><div><span>匹配内点</span><strong id="metricMatches">—</strong></div><div><span>计算耗时</span><strong id="metricTime">—</strong></div>
+      </section>
+      <section id="downloadPanel" class="panel export-panel" hidden>
+        <p id="savedLabel" class="small-note">结果已保存到工具历史</p><button id="retrySave" hidden>重试保存结果</button><div class="export-actions"><button id="downloadAligned" class="primary">导出当前结果 PNG</button><button id="downloadAll">导出完整 ZIP</button><button id="downloadMask">导出训练掩码</button></div>
+      </section>
+    </div>
+  </div>
+  <section class="panel history-panel"><div class="section-head"><h2>历史结果</h2><button id="refreshHistory" class="quiet">刷新</button></div><div id="historyList" class="history-list"><p class="small-note">还没有保存的结果</p></div></section>
+  <div class="page-actions"><span class="small-note">算法：PairShot Color v2</span><button id="clearBtn" class="quiet">清空当前选图</button></div>
+</main>
+<dialog id="helpDialog"><div class="section-head"><h2>配准工具</h2><button id="closeHelp" aria-label="关闭使用说明">×</button></div><ol><li>选择同一场景、有足够重叠纹理的两张照片。参考图决定结果的位置、尺寸和颜色。</li><li>优先使用 1024 px 查看效果；计算过程中可取消，已选照片会保留。</li><li>结果可在纯几何、全局调色和最终校正之间切换。双指缩放、拖动平移；视图旋转不改变导出的图片。</li><li>完成的结果保存在 App 内，可从历史结果重新打开，或导出 PNG、掩码和完整 ZIP。</li></ol><h3>结果怎么看</h3><p>遮挡、反光、运动和缺乏纹理的区域可能无法可靠配准。掩码是质量筛选提示，并不保证每个像素都正确。颜色误差是当前图对拟合后的诊断。</p><p>增强颜色对齐使用参考图的低频颜色，也可能带入较大尺度的结构。严格训练数据可关闭此项，或使用“仅稠密几何”“几何 + 全局调色”结果。</p><h3>手机本地计算</h3><p>RootSIFT / MAGSAC 全局配准 → DIS 稠密光流 → 自适应全局颜色映射 → 带掩码的高斯低频颜色补偿。计算引擎随 App 安装，照片不上传。大图在导入时会受手机内存限制缩小；原始照片不会被修改。</p></dialog>
+<div id="toast" class="toast" role="status" hidden></div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>
