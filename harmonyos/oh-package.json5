@@ -1,0 +1,8 @@
+{
+  "modelVersion": "5.0.0",
+  "name": "pairshot-harmony",
+  "version": "1.0.0",
+  "description": "PairShot native HarmonyOS camera and USB PTP companion",
+  "dependencies": {},
+  "devDependencies": {}
+}

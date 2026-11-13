@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "app_name",
+      "value": "PairShot"
+    },
+    {
+      "name": "module_desc",
+      "value": "手机多镜头与 USB 相机联动拍摄"
+    },
+    {
+      "name": "camera_reason",
+      "value": "用于预览手机镜头并拍摄照片"
+    }
+  ]
+}

@@ -1,5 +1,7 @@
 # PairShot · Android 手机多焦距与相机联动拍摄
 
+新增原生 HarmonyOS 5.1 / API 18 工程：[鸿蒙版源码、HAP 构建与签名说明](harmonyos/README.md)。鸿蒙版使用 ArkTS / ArkUI，实现手机镜头顺序拍摄、USB/PTP 联动和 ZIP 归档；真机兼容性仍需设备验证。下文介绍 Android 版。
+
 [![Android CI/CD](https://github.com/yqwu905/PairShot/actions/workflows/android.yml/badge.svg)](https://github.com/yqwu905/PairShot/actions/workflows/android.yml)
 [下载自动构建的 APK](https://github.com/yqwu905/PairShot/releases) · [CI/CD 与签名配置](docs/ci-cd.md)
 

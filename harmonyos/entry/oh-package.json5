@@ -1,0 +1,8 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "PairShot native HarmonyOS camera and USB PTP module",
+  "main": "",
+  "author": "",
+  "dependencies": {}
+}
