@@ -89,13 +89,17 @@ function makeHarness(options = {}) {
       let zoom = 1;
       const id = state.inputs.at(-1).device.cameraId;
       const session = emitter({
+        started: 0, stopped: 0, released: 0,
         beginConfig() {}, canAddInput: () => true, addInput() {},
         canAddOutput: output => !(output.kind === 'photo' && state.rejectPhotoFor === id),
-        addOutput() {}, async commitConfig() {}, async start() {}, async stop() {}, async release() {},
+        addOutput() {}, async commitConfig() {},
+        async start() { session.started++; }, async stop() { session.stopped++; },
+        async release() { session.released++; },
         isFocusModeSupported: () => false, isExposureModeSupported: () => false,
         getZoomRatioRange: () => [0.5, 6], getZoomRatio: () => zoom,
         setZoomRatio(value) { zoom = value; },
       });
+      if (options.configureSession) options.configureSession(session, id, state);
       state.sessions.push(session);
       return session;
     },
@@ -158,6 +162,202 @@ test('only photo-capable JPEG cameras are listed, zoom uses the published range'
   assert.equal(service.setZoom(0.1), 0.5);
   assert.throws(() => service.setZoom(NaN), /倍率无效/);
   await service.stop();
+});
+
+test('unsupported, invalid, and fixed zoom ranges never read or write zoom status', async t => {
+  for (const [label, range, expected] of [
+    ['undefined', undefined, 1], ['empty', [], 1], ['zero', [0, 0], 1],
+    ['nonfinite', [1, Infinity], 1], ['fixed', [1, 1], 1], ['fixed nonunit', [2, 2], 2],
+  ]) {
+    await t.test(label, async () => {
+      const h = makeHarness({ configureSession(session) {
+        session.getZoomRatioRange = () => range;
+        session.getZoomRatio = () => { assert.fail('Unsupported zoom must not query device status'); };
+        session.setZoomRatio = () => { assert.fail('Unsupported zoom must not update device metadata'); };
+      } });
+      await h.service.startPreview('back', 'surface');
+      assert.equal(h.service.getCurrentLensId(), 'back');
+      assert.deepEqual(h.service.getZoomRange(), [expected, expected]);
+      assert.equal(h.service.setZoom(3), expected);
+      assert.equal(h.state.inputs[0].closed, 0);
+      const pending = h.service.capture();
+      h.state.outputs[0].callbacks.get('photoAvailable')(null, nativePhoto());
+      assert.equal((await pending).zoom, expected);
+      await h.service.stop();
+    });
+  }
+});
+
+test('physical lenses keep their native view without probing unsupported zoom controls', async () => {
+  const tele = { cameraId: 'tele', cameraPosition: 1, cameraType: 3 };
+  const h = makeHarness({
+    configure(manager, devices) {
+      devices[0].constituentCameraDevices = [tele];
+      manager.getCameraDevices = position => position === 1 ? [tele] : [];
+    },
+    configureSession(session) {
+      session.getZoomRatioRange = () => { assert.fail('Physical lenses must not query zoom metadata'); };
+      session.getZoomRatio = () => { assert.fail('Physical lenses must not query current zoom'); };
+      session.setZoomRatio = () => { assert.fail('Physical lenses must not set logical zoom'); };
+    },
+  });
+  const errors = [];
+  h.service.onSessionError = message => errors.push(message);
+  await h.service.startPreview('tele', 'surface');
+  assert.equal(h.service.getCurrentLensId(), 'tele');
+  assert.deepEqual(h.service.getZoomRange(), [1, 1]);
+  assert.equal(h.service.setZoom(1), 1);
+  assert.equal(h.state.sessions[0].started, 1);
+  assert.equal(h.state.sessions[0].released, 0);
+  assert.deepEqual(errors, []);
+  const pending = h.service.capture();
+  h.state.outputs[0].callbacks.get('photoAvailable')(null, nativePhoto());
+  assert.equal((await pending).lensId, 'tele');
+  assert.match(h.service.getDiagnosticReport(), /tele[^\n]+物理镜头保持原生视角/);
+  await h.service.stop();
+});
+
+test('an unavailable current-zoom status does not turn successful startup into a fatal preview failure', async () => {
+  const h = makeHarness({ configureSession(session) {
+    session.getZoomRatio = () => { throw { code: 7400201, message: 'Camera service fatal error' }; };
+    session.setZoomRatio = () => { assert.fail('Failed status query must disable zoom writes'); };
+  } });
+  await h.service.startPreview('back', 'surface');
+  assert.equal(h.service.getCurrentLensId(), 'back');
+  assert.equal(h.service.setZoom(3), 1);
+  assert.equal(h.state.sessions[0].released, 0);
+  assert.match(h.service.getDiagnosticReport(), /getZoomRatio[^\n]+7400201/);
+  await h.service.stop();
+});
+
+test('a directly enumerated device explicitly marked nonlogical also skips logical zoom', async () => {
+  const h = makeHarness({
+    configure(manager, devices) { devices[0].isLogicalCamera = false; },
+    configureSession(session) {
+      session.getZoomRatioRange = () => { assert.fail('Explicitly physical devices must skip logical zoom'); };
+    },
+  });
+  const lens = h.service.listCameras().find(lens => lens.id === 'back');
+  assert.equal(lens.physical, true);
+  await h.service.startPreview('back', 'surface');
+  assert.equal(h.service.setZoom(2), 1);
+  await h.service.stop();
+});
+
+test('a failing zoom capability probe keeps the camera usable with zoom disabled', async () => {
+  const h = makeHarness({ configureSession(session) {
+    session.getZoomRatioRange = () => { throw { code: 7400201, message: 'No physical zoom metadata' }; };
+    session.getZoomRatio = () => { assert.fail('Failed range query must not read status'); };
+  } });
+  await h.service.startPreview('back', 'surface');
+  assert.equal(h.service.getCurrentLensId(), 'back');
+  assert.equal(h.service.setZoom(5), 1);
+  assert.match(h.service.getDiagnosticReport(), /getZoomRatioRange[^\n]+7400201/);
+  await h.service.stop();
+});
+
+test('optional autofocus and exposure failures preserve camera defaults and do not abort startup', async () => {
+  const h = makeHarness({ configureSession(session) {
+    session.isFocusModeSupported = () => true;
+    session.setFocusMode = () => { throw { code: 7400201, message: 'AF unavailable' }; };
+    session.isExposureModeSupported = () => true;
+    session.setExposureMode = () => { throw { code: 7400201, message: 'AE unavailable' }; };
+  } });
+  await h.service.startPreview('back', 'surface');
+  assert.equal(h.service.getCurrentLensId(), 'back');
+  assert.equal(h.state.sessions[0].started, 1);
+  assert.match(h.service.getDiagnosticReport(), /自动对焦不可用[^\n]+7400201/);
+  assert.match(h.service.getDiagnosticReport(), /自动曝光不可用[^\n]+7400201/);
+  await h.service.stop();
+});
+
+test('zoom updates keep the requested ratio without reading hardware status before it takes effect', async () => {
+  let statusReads = 0;
+  const writes = [];
+  const h = makeHarness({ configureSession(session) {
+    session.getZoomRatio = () => { statusReads++; return 1; };
+    session.setZoomRatio = ratio => writes.push(ratio);
+  } });
+  await h.service.startPreview('back', 'surface');
+  assert.equal(h.service.setZoom(1), 1);
+  assert.deepEqual(writes, []);
+  assert.equal(h.service.setZoom(2), 2);
+  assert.deepEqual(writes, [2]);
+  assert.equal(statusReads, 1);
+  const pending = h.service.capture();
+  h.state.outputs[0].callbacks.get('photoAvailable')(null, nativePhoto());
+  assert.equal((await pending).zoom, 2);
+  await h.service.stop();
+});
+
+test('a rejected zoom update retains the last ratio and does not close a live session', async () => {
+  let writes = 0;
+  const h = makeHarness({ configureSession(session) {
+    session.setZoomRatio = () => { writes++; throw { code: 7400201, message: 'Zoom control unsupported' }; };
+  } });
+  await h.service.startPreview('back', 'surface');
+  assert.equal(h.service.setZoom(2), 1);
+  assert.deepEqual(h.service.getZoomRange(), [1, 1]);
+  assert.equal(h.service.setZoom(3), 1);
+  assert.equal(writes, 1);
+  assert.equal(h.service.getCurrentLensId(), 'back');
+  await h.service.stop();
+});
+
+test('real input-open and session errors retain camera ID, API stage, and native code', async t => {
+  for (const operation of ['createCameraInput', 'CameraInput.open', 'PhotoSession.commitConfig', 'PhotoSession.start']) {
+    await t.test(operation, async () => {
+      const fail = () => { throw { code: 7400201, message: 'Camera service fatal error' }; };
+      const h = makeHarness({ configureSession(session) {
+        if (operation === 'PhotoSession.commitConfig') session.commitConfig = async () => fail();
+        if (operation === 'PhotoSession.start') session.start = async () => fail();
+      } });
+      if (operation === 'createCameraInput') h.manager.createCameraInput = fail;
+      if (operation === 'CameraInput.open') h.state.openHook = fail;
+      await assert.rejects(h.service.startPreview('back', 'surface'), error => {
+        assert.match(error.message, /镜头 back/);
+        assert.ok(error.message.includes(operation));
+        assert.match(error.message, /7400201/);
+        return true;
+      });
+      assert.equal(h.service.getCurrentLensId(), '');
+      assert.ok(h.state.inputs.every(input => input.closed === 1));
+      assert.ok(h.state.outputs.every(output => output.released === 1));
+      assert.match(h.service.getDiagnosticReport(), /打开镜头失败[^\n]+7400201/);
+      await h.service.stop();
+    });
+  }
+});
+
+test('native input errors during an optional zoom query still invalidate and release the session', async () => {
+  const h = makeHarness({ configureSession(session, id, state) {
+    session.getZoomRatio = () => {
+      state.inputs.at(-1).callbacks.get('error')({ code: 7400201, message: 'Device disconnected' });
+      throw { code: 7400201, message: 'Camera service fatal error' };
+    };
+  } });
+  const errors = [];
+  h.service.onSessionError = message => errors.push(message);
+  await assert.rejects(h.service.startPreview('back', 'surface'), /取消/);
+  await h.service.stop();
+  assert.equal(h.service.getCurrentLensId(), '');
+  assert.match(errors[0], /CameraInput.error[^\n]+7400201/);
+  assert.equal(h.state.inputs[0].closed, 1);
+  assert.equal(h.state.outputs[0].released, 1);
+});
+
+test('native input errors during zoom updates cannot report a stopped camera as ready', async () => {
+  const h = makeHarness({ configureSession(session, id, state) {
+    session.setZoomRatio = () => {
+      state.inputs.at(-1).callbacks.get('error')({ code: 7400201, message: 'Device disconnected' });
+      throw { code: 7400201, message: 'Camera service fatal error' };
+    };
+  } });
+  await h.service.startPreview('back', 'surface');
+  assert.throws(() => h.service.setZoom(2), /异常停止/);
+  await h.service.stop();
+  assert.equal(h.service.getCurrentLensId(), '');
+  assert.equal(h.state.inputs[0].closed, 1);
 });
 
 test('JPEG is copied before native buffers are released, with capture metadata intact', async () => {
@@ -333,6 +533,34 @@ test('API 18 type queries discover an extra lens when the newer list API is abse
   await h.service.stop();
 });
 
+test('direct enumeration takes precedence over a same-ID constituent descriptor for capabilities and opening', async () => {
+  const constituent = { cameraId: 'tele', cameraPosition: 1, cameraType: 3 };
+  const direct = { cameraId: 'tele', cameraPosition: 1, cameraType: 3 };
+  const h = makeHarness({ configure(manager, devices) {
+    devices[0].constituentCameraDevices = [constituent];
+    manager.getCameraDevices = position => position === 1 ? [direct] : [];
+    const capabilities = manager.getSupportedOutputCapability;
+    manager.getSupportedOutputCapability = device => {
+      assert.notEqual(device, constituent, 'A directly enumerated object must replace its constituent descriptor');
+      return capabilities(device);
+    };
+  } });
+  const lens = h.service.listCameras().find(lens => lens.id === 'tele');
+  assert.ok(lens);
+  assert.equal(lens.physical, true);
+  assert.equal(lens.parentId, 'back');
+  await h.service.startPreview('tele', 'surface');
+  assert.equal(h.state.inputs[0].device, direct);
+  await h.service.stop();
+});
+
+test('concurrent capability failures identify the query, device combination, and native code', () => {
+  const h = makeHarness();
+  h.manager.getCameraConcurrentInfos = () => { throw { code: 7400201, message: 'Camera service fatal error' }; };
+  assert.match(h.service.getConcurrentSupport(['back', 'front']), /getCameraConcurrentInfos \[back, front\].*7400201/);
+  assert.equal(h.state.inputs.length, 0);
+});
+
 test('one failed extended query or capability probe does not hide the remaining usable cameras', () => {
   const h = makeHarness({ configure(manager, devices) {
     manager.getCameraDevices = () => { throw new Error('Extended query unavailable'); };
@@ -357,6 +585,34 @@ test('concurrent setup uses the matching photo-mode capabilities and returned op
     'Earlier inputs must remain open when the next physical camera starts');
   await h.service.stop();
   assert.ok(h.state.inputs.every(input => input.closed === 1));
+});
+
+test('a physical channel without zoom controls does not cancel concurrent JPEG capture', async () => {
+  const h = concurrentHarness();
+  h.devices[0].constituentCameraDevices = [h.devices.find(device => device.cameraId === 'tele')];
+  const createSession = h.manager.createSession;
+  h.manager.createSession = () => {
+    const session = createSession();
+    if (h.state.inputs.at(-1).device.cameraId === 'tele') {
+      session.getZoomRatioRange = () => { assert.fail('Physical zoom must be skipped'); };
+      session.getZoomRatio = () => { assert.fail('Physical status query must be skipped'); };
+      session.setZoomRatio = () => { assert.fail('Unsupported physical zoom must be skipped'); };
+    }
+    return session;
+  };
+  const ids = ['back', 'tele'];
+  await h.service.startConcurrent(ids, ['s-back', 's-tele']);
+  assert.equal(h.service.isConcurrentReady(ids), true);
+  assert.deepEqual(h.service.getZoomRange(), [1, 1]);
+  assert.equal(h.service.setZoom(1), 1);
+  const photos = [];
+  const pending = h.service.captureConcurrent(async photo => { photos.push(photo); });
+  assert.ok(h.state.outputs.every(output => output.captures === 1));
+  for (const output of h.state.outputs) output.callbacks.get('photoAvailable')(null, nativePhoto());
+  assert.deepEqual(await pending, []);
+  assert.deepEqual(photos.map(photo => photo.lensId).sort(), ids.slice().sort());
+  assert.ok(photos.every(photo => photo.captureMode === 'CONCURRENT'));
+  await h.service.stop();
 });
 
 test('missing concurrent support, preview-only support, and mismatched device IDs are rejected before opening', async () => {

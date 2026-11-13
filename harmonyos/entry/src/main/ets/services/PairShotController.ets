@@ -343,6 +343,9 @@ export class PairShotController {
     this.state.minZoom = range.length > 0 ? range[0] : 1;
     this.state.maxZoom = range.length > 1 ? range[1] : this.state.minZoom;
     this.state.zoom = this.camera.setZoom(Math.min(this.state.maxZoom, Math.max(this.state.minZoom, this.state.zoom)));
+    const activeRange = this.camera.getZoomRange();
+    this.state.minZoom = activeRange[0];
+    this.state.maxZoom = activeRange[1];
     this.state.previewReady = true;
     this.state.status = concurrent ? `${ids.length} 路并发会话就绪；快门会并发提交` :
       (ids.length > 1 ? '顺序拍摄就绪；镜头会依次曝光' : '单镜头已就绪');
@@ -384,6 +387,9 @@ export class PairShotController {
         throw new Error('变焦倍率无效');
       }
       this.state.zoom = this.camera.setZoom(Math.min(this.state.maxZoom, Math.max(this.state.minZoom, value)));
+      const range = this.camera.getZoomRange();
+      this.state.minZoom = range[0];
+      this.state.maxZoom = range[1];
     });
   }
 

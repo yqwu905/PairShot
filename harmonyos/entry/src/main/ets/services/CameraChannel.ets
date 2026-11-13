@@ -8,6 +8,7 @@ import { CapturedPhoto } from '../model/Models';
 export class CameraChannel {
   onPreviewLayoutChanged: ((ratio: number) => void) | undefined = undefined;
   onSessionError: ((message: string) => void) | undefined = undefined;
+  onDiagnostic: ((message: string) => void) | undefined = undefined;
   private manager: camera.CameraManager;
   private input: camera.CameraInput | undefined = undefined;
   private preview: camera.PreviewOutput | undefined = undefined;
@@ -21,6 +22,8 @@ export class CameraChannel {
   private lensLabel: string = '';
   private zoom: number = 1;
   private zoomRange: number[] = [1, 1];
+  private zoomEnabled: boolean = false;
+  private stage: string = '尚未打开';
   private previewAspectRatio: number = 3 / 4;
   private pendingResolve: ((photo: CapturedPhoto) => void) | undefined = undefined;
   private pendingReject: ((error: Error) => void) | undefined = undefined;
@@ -31,18 +34,20 @@ export class CameraChannel {
   private selectedDevice: camera.CameraDevice;
   private capabilities: camera.CameraOutputCapability;
   private concurrentType: camera.CameraConcurrentType | undefined;
+  private physicalLens: boolean;
   private displayCallback: () => void = (): void => {
     this.updatePreviewRotation();
   };
 
   constructor(manager: camera.CameraManager, device: camera.CameraDevice,
     capabilities: camera.CameraOutputCapability, label: string,
-    concurrentType: camera.CameraConcurrentType | undefined = undefined) {
+    concurrentType: camera.CameraConcurrentType | undefined = undefined, physicalLens: boolean = false) {
     this.manager = manager;
     this.selectedDevice = device;
     this.capabilities = capabilities;
     this.lensLabel = label;
     this.concurrentType = concurrentType;
+    this.physicalLens = physicalLens;
   }
 
   getCurrentLensId(): string {
@@ -65,9 +70,24 @@ export class CameraChannel {
     if (!Number.isFinite(value)) {
       throw new Error('变焦倍率无效');
     }
+    if (!this.zoomEnabled) {
+      return this.zoom;
+    }
     const bounded = Math.max(this.zoomRange[0], Math.min(this.zoomRange[1], value));
-    session.setZoomRatio(bounded);
-    this.zoom = session.getZoomRatio();
+    if (bounded === this.zoom) {
+      return this.zoom;
+    }
+    try {
+      session.setZoomRatio(bounded);
+      // CameraKit applies zoom after one or two frames. An immediate status read
+      // can be stale, and some physical-camera drivers do not implement it.
+      this.zoom = bounded;
+    } catch (error) {
+      this.disableZoom('设置变焦失败，保留当前倍率：' + this.errorText(error as Error));
+    }
+    if (!this.running) {
+      throw new Error('相机已因设备或会话异常停止，请重新打开预览');
+    }
     return this.zoom;
   }
 
@@ -87,8 +107,9 @@ export class CameraChannel {
       try {
         await this.openPreview(lensId, surfaceId, generation);
       } catch (error) {
+        const failure = this.operationError(this.stage, error as Error);
         await this.releaseResources();
-        throw error as Error;
+        throw failure;
       }
     });
     this.lifecycle = operation.catch((): void => {});
@@ -156,22 +177,30 @@ export class CameraChannel {
       throw new Error('选中的镜头当前不可用');
     }
     const capabilities = this.capabilities;
+    this.stage = '选择预览和 JPEG 配置';
     const photoProfile = this.choosePhotoProfile(capabilities.photoProfiles);
     const previewProfile = this.choosePreviewProfile(capabilities.previewProfiles, photoProfile);
+    this.diagnose(`配置：JPEG ${photoProfile.size.width}x${photoProfile.size.height} format=${photoProfile.format}；` +
+      `预览 ${previewProfile.size.width}x${previewProfile.size.height} format=${previewProfile.format}`);
+    this.stage = 'createCameraInput';
     const input = this.manager.createCameraInput(device);
     this.input = input;
     this.device = device;
     input.on('error', device, (error: BusinessError): void => {
-      this.invalidate(new Error(`摄像头异常（${error.code}）：${error.message}`), generation);
+      this.invalidate(this.operationError('CameraInput.error / ' + this.stage, error), generation);
     });
+    this.stage = 'CameraInput.open';
     if (this.concurrentType === undefined) {
       await input.open();
     } else {
       await input.open(this.concurrentType);
     }
     this.requireGeneration(generation);
+    this.diagnose('CameraInput.open 成功');
+    this.stage = 'createPreviewOutput';
     const preview = this.manager.createPreviewOutput(previewProfile, surfaceId);
     this.preview = preview;
+    this.stage = 'createPhotoOutput';
     const output = this.manager.createPhotoOutput(photoProfile);
     this.output = output;
     output.on('frameShutter', (error: BusinessError, info: camera.FrameShutterInfo): void => {
@@ -198,43 +227,125 @@ export class CameraChannel {
     preview.on('error', (error: BusinessError): void => {
       this.invalidate(new Error(`预览异常（${error.code}）：${error.message}`), generation);
     });
+    this.stage = 'createSession(NORMAL_PHOTO)';
     const session = this.manager.createSession<camera.PhotoSession>(camera.SceneMode.NORMAL_PHOTO);
     this.session = session;
     session.on('error', (error: BusinessError): void => {
-      this.invalidate(new Error(`相机会话异常（${error.code}）：${error.message}`), generation);
+      this.invalidate(this.operationError('PhotoSession.error / ' + this.stage, error), generation);
     });
+    this.stage = 'PhotoSession.beginConfig';
     session.beginConfig();
+    this.stage = 'PhotoSession.addInput';
     if (!session.canAddInput(input)) {
       throw new Error('系统未允许使用此镜头，请关闭其他相机应用后重试');
     }
     session.addInput(input);
+    this.stage = 'PhotoSession.addOutput(preview)';
     if (!session.canAddOutput(preview)) {
       throw new Error('此镜头不支持所选预览配置');
     }
     session.addOutput(preview);
+    this.stage = 'PhotoSession.addOutput(JPEG)';
     if (!session.canAddOutput(output)) {
       throw new Error('此镜头不支持预览与 JPEG 拍摄组合');
     }
     session.addOutput(output);
+    this.stage = 'PhotoSession.commitConfig';
     await session.commitConfig();
     this.requireGeneration(generation);
-    if (session.isFocusModeSupported(camera.FocusMode.FOCUS_MODE_CONTINUOUS_AUTO)) {
-      session.setFocusMode(camera.FocusMode.FOCUS_MODE_CONTINUOUS_AUTO);
-    }
-    if (session.isExposureModeSupported(camera.ExposureMode.EXPOSURE_MODE_CONTINUOUS_AUTO)) {
-      session.setExposureMode(camera.ExposureMode.EXPOSURE_MODE_CONTINUOUS_AUTO);
-    }
+    this.configureOptionalControls(session);
+    this.requireGeneration(generation);
+    this.stage = 'PhotoSession.start';
     await session.start();
     this.requireGeneration(generation);
+    this.diagnose('PhotoSession.start 成功');
     this.running = true;
     this.surfaceId = surfaceId;
-    const range = session.getZoomRatioRange();
-    this.zoomRange = range.length >= 2 && range[0] > 0 && range[1] >= range[0] ?
-      [range[0], range[1]] : [1, 1];
-    this.zoom = session.getZoomRatio();
+    this.configureZoom(session);
+    this.requireGeneration(generation);
+    this.stage = '预览运行中';
     this.updatePreviewRotation();
     display.on('change', this.displayCallback);
     this.displaySubscribed = true;
+  }
+
+  private configureOptionalControls(session: camera.PhotoSession): void {
+    this.stage = '配置自动对焦';
+    try {
+      if (session.isFocusModeSupported(camera.FocusMode.FOCUS_MODE_CONTINUOUS_AUTO)) {
+        session.setFocusMode(camera.FocusMode.FOCUS_MODE_CONTINUOUS_AUTO);
+      }
+    } catch (error) {
+      this.diagnose('自动对焦不可用，保留设备默认值：' + this.errorText(error as Error));
+    }
+    this.stage = '配置自动曝光';
+    try {
+      if (session.isExposureModeSupported(camera.ExposureMode.EXPOSURE_MODE_CONTINUOUS_AUTO)) {
+        session.setExposureMode(camera.ExposureMode.EXPOSURE_MODE_CONTINUOUS_AUTO);
+      }
+    } catch (error) {
+      this.diagnose('自动曝光不可用，保留设备默认值：' + this.errorText(error as Error));
+    }
+  }
+
+  private configureZoom(session: camera.PhotoSession): void {
+    this.zoom = 1;
+    this.zoomRange = [1, 1];
+    this.zoomEnabled = false;
+    // Match the Android physical-output path: preserve the selected sensor's
+    // native view instead of applying logical zoom controls to a physical input.
+    if (this.physicalLens) {
+      this.diagnose('物理镜头保持原生视角，跳过变焦范围、当前倍率读取和倍率设置');
+      return;
+    }
+    this.stage = 'getZoomRatioRange';
+    try {
+      // Despite the SDK return type, CameraKit documents undefined when zoom
+      // is unsupported. Fixed physical lenses also return an empty/fixed range.
+      const range = session.getZoomRatioRange();
+      if (!range || range.length < 2 || !Number.isFinite(range[0]) || !Number.isFinite(range[1]) ||
+        range[0] <= 0 || range[1] < range[0]) {
+        this.diagnose('未开放变焦范围，跳过读取和设置倍率');
+        return;
+      }
+      this.zoomRange = [range[0], range[1]];
+      if (range[0] === range[1]) {
+        this.zoom = range[0];
+        this.diagnose(`固定倍率 ${this.zoom}，跳过读取和设置倍率`);
+        return;
+      }
+      this.stage = 'getZoomRatio';
+      const current = session.getZoomRatio();
+      if (!Number.isFinite(current) || current < range[0] || current > range[1]) {
+        this.disableZoom('设备未返回有效的当前倍率，保留默认倍率');
+        return;
+      }
+      this.zoom = current;
+      this.zoomEnabled = true;
+    } catch (error) {
+      this.disableZoom(this.stage + ' 不可用，保留默认倍率：' + this.errorText(error as Error));
+    }
+  }
+
+  private disableZoom(reason: string): void {
+    this.zoomEnabled = false;
+    this.zoomRange = [this.zoom, this.zoom];
+    this.diagnose(reason + '；停用变焦，保留预览与拍照');
+  }
+
+  private errorText(error: Error): string {
+    const code = (error as BusinessError).code;
+    return (code !== undefined ? `错误码 ${code}：` : '') + (error.message || String(error));
+  }
+
+  private operationError(operation: string, error: Error): Error {
+    return new Error(`镜头 ${this.selectedDevice.cameraId} · ${operation}：${this.errorText(error)}`);
+  }
+
+  private diagnose(message: string): void {
+    if (this.onDiagnostic) {
+      this.onDiagnostic(`镜头 ${this.selectedDevice.cameraId}：${message}`);
+    }
   }
 
   private async receivePhoto(photo: camera.Photo, generation: number): Promise<void> {
@@ -338,6 +449,7 @@ export class CameraChannel {
     this.running = false;
     this.surfaceId = '';
     this.zoomRange = [1, 1];
+    this.zoomEnabled = false;
     if (this.displaySubscribed) {
       try { display.off('change', this.displayCallback); } catch (error) {}
       this.displaySubscribed = false;

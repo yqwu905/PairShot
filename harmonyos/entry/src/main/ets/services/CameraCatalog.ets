@@ -1,4 +1,5 @@
 import { camera } from '@kit.CameraKit';
+import { BusinessError } from '@kit.BasicServicesKit';
 import { LensInfo, MAX_PHONE_LENSES } from '../model/Models';
 
 // Public CameraKit additions, feature-detected on the running OS. These exact
@@ -25,12 +26,14 @@ class CatalogEntry {
   reason: string = '';
   usable: boolean = false;
   logical: boolean = false;
+  directlyEnumerated: boolean;
 
   constructor(device: camera.CameraDevice, source: string, physical: boolean, parentId: string) {
     this.device = device;
     this.source = source;
     this.physical = physical;
     this.parentId = parentId;
+    this.directlyEnumerated = !physical;
   }
 }
 
@@ -147,6 +150,12 @@ export class CameraCatalog {
     }
     const prior = this.entries.find((entry: CatalogEntry): boolean => entry.device.cameraId === device.cameraId);
     if (prior) {
+      // A constituent descriptor can arrive before the same ID is enumerated
+      // directly. Prefer the returned direct device for all capability/open calls.
+      if (!physical && !prior.directlyEnumerated) {
+        prior.device = device;
+        prior.directlyEnumerated = true;
+      }
       if (!prior.source.includes(source)) {
         prior.source += '、' + source;
       }
@@ -163,6 +172,9 @@ export class CameraCatalog {
       const entry = this.entries.find((item: CatalogEntry): boolean => item.device.cameraId === device.cameraId);
       if (entry && (extended.isLogicalCamera === true || (children && children.length > 0))) {
         entry.logical = true;
+      }
+      if (entry && extended.isLogicalCamera === false) {
+        entry.physical = true;
       }
       if (children && Array.isArray(children)) {
         for (const child of children) {
@@ -182,6 +194,11 @@ export class CameraCatalog {
       throw new Error('所选镜头未提供可用的拍照能力，请刷新镜头并复制诊断信息');
     }
     return entry.device;
+  }
+
+  isPhysicalDevice(id: string): boolean {
+    return this.entries.some((entry: CatalogEntry): boolean => entry.device.cameraId === id &&
+      entry.physical && !entry.logical);
   }
 
   label(device: camera.CameraDevice): string {
@@ -208,7 +225,14 @@ export class CameraCatalog {
     if (typeof this.manager.getCameraConcurrentInfos !== 'function') {
       throw new Error('系统未提供多摄并发能力查询接口');
     }
-    const infos = this.manager.getCameraConcurrentInfos(devices);
+    let infos: camera.CameraConcurrentInfo[];
+    try {
+      infos = this.manager.getCameraConcurrentInfos(devices);
+    } catch (error) {
+      const failure = error as BusinessError;
+      throw new Error(`getCameraConcurrentInfos [${ids.join(', ')}] 失败（错误码 ${failure.code}）：` +
+        `${failure.message}。请先仅选一枚镜头验证预览，再检查可并发的组合`);
+    }
     if (!infos || infos.length !== ids.length) {
       throw new Error('系统未声明所选镜头组合支持并发。可更换组合，或手动选择顺序拍摄');
     }
@@ -237,7 +261,7 @@ export class CameraCatalog {
   }
 
   summary(): string {
-    return `发现 ${this.entries.length} 路相机，可拍照 ${this.lenses.length} 路`;
+    return `发现 ${this.entries.length} 路相机，${this.lenses.length} 路具备拍照配置`;
   }
 
   record(message: string): void {
@@ -252,7 +276,7 @@ export class CameraCatalog {
     for (const entry of this.entries) {
       lines.push(`id=${entry.device.cameraId} position=${entry.device.cameraPosition} type=${entry.device.cameraType}` +
         ` source=${entry.source} physical=${entry.physical} logical=${entry.logical} parent=${entry.parentId || '-'} ` +
-        (entry.usable ? '可拍照' : '排除：' + entry.reason));
+        (entry.usable ? '具备 JPEG/预览配置（实际打开结果见下方）' : '排除：' + entry.reason));
     }
     return lines.concat(this.events).join('\n');
   }

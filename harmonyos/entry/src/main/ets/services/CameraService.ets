@@ -1,4 +1,5 @@
 import { common } from '@kit.AbilityKit';
+import { BusinessError } from '@kit.BasicServicesKit';
 import { camera } from '@kit.CameraKit';
 import { CapturedPhoto, LensInfo } from '../model/Models';
 import { CameraCatalog, ConcurrentDevicePlan } from './CameraCatalog';
@@ -105,7 +106,16 @@ export class CameraService {
     }
     this.ensureCatalog();
     const device = this.catalog.getDevice(lensId);
-    const caps = this.manager.getSupportedOutputCapability(device, camera.SceneMode.NORMAL_PHOTO);
+    let caps: camera.CameraOutputCapability;
+    try {
+      caps = this.manager.getSupportedOutputCapability(device, camera.SceneMode.NORMAL_PHOTO);
+    } catch (error) {
+      const failure = error as BusinessError;
+      const message = `镜头 ${lensId} · getSupportedOutputCapability(NORMAL_PHOTO)：` +
+        `错误码 ${failure.code}：${failure.message}`;
+      this.catalog.record(message);
+      throw new Error(message);
+    }
     const plan = new ConcurrentDevicePlan(device, camera.CameraConcurrentType.CAMERA_FULL_CAPABILITY, caps);
     await this.openChannels([plan], [surfaceId], false);
   }
@@ -140,7 +150,11 @@ export class CameraService {
           this.requireGeneration(token);
           const plan = plans[index];
           const channel = new CameraChannel(this.manager, plan.device, plan.capabilities,
-            this.catalog.label(plan.device), concurrent ? plan.type : undefined);
+            this.catalog.label(plan.device), concurrent ? plan.type : undefined,
+            this.catalog.isPhysicalDevice(plan.device.cameraId));
+          channel.onDiagnostic = (message: string): void => {
+            this.catalog.record(message);
+          };
           this.channels.push(channel);
           channel.onPreviewLayoutChanged = (): void => {
             if (token === this.generation && this.onPreviewLayoutChanged) {
