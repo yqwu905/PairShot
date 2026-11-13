@@ -5,14 +5,16 @@ import { LensInfo, MAX_PHONE_LENSES } from '../model/Models';
 // signatures are documented by Huawei (getCameraDevices API 23, constituents API 24).
 // Keeping them in a compatibility interface preserves the API 18 minimum OS;
 // no camera IDs, profiles, or physical devices are synthesized.
+// Newer SDKs already require these members. An extending declaration must not
+// make them optional; runtime feature checks below handle older OS versions.
 interface ExtendedCameraManager extends camera.CameraManager {
-  getCameraDevices?(position: camera.CameraPosition, types: camera.CameraType[],
+  getCameraDevices(position: camera.CameraPosition, types: camera.CameraType[],
     connectType: camera.ConnectionType): camera.CameraDevice[];
 }
 
 interface ExtendedCameraDevice extends camera.CameraDevice {
-  isLogicalCamera?: boolean;
-  constituentCameraDevices?: camera.CameraDevice[];
+  readonly isLogicalCamera: boolean;
+  readonly constituentCameraDevices: camera.CameraDevice[];
 }
 
 class CatalogEntry {
