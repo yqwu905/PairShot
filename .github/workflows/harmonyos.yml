@@ -1,0 +1,105 @@
+name: HarmonyOS HAP release
+
+on:
+  push:
+    tags: ['harmonyos-v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: harmonyos-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/harmonyos-v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install pinned HarmonyOS CLI and SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h "$RUNNER_TEMP"
+          tools_dir="$RUNNER_TEMP/harmony-tools"
+          archive="$RUNNER_TEMP/commandline-tools-linux-x64-5.1.0.840.zip"
+          mkdir -p "$tools_dir"
+          curl --fail --location --silent --show-error --retry 3 --connect-timeout 30 --max-time 1800 \
+            'https://repo.huaweicloud.com/harmonyos/ohpm/5.1.0/commandline-tools-linux-x64-5.1.0.840.zip' \
+            --output "$archive"
+          printf '%s  %s\n' '1dcefa4741dc289277560b2802040e0c45b433898d8db453d711d5376e0478f1' "$archive" | sha256sum --check
+          unzip -q "$archive" -d "$tools_dir"
+          rm "$archive"
+          deveco="$tools_dir/command-line-tools"
+          {
+            echo "DEVECO_HOME=$deveco"
+            echo "DEVECO_NODE_HOME=$deveco/tool/node"
+            echo "NODE_HOME=$deveco/tool/node"
+            echo "DEVECO_SDK_HOME=$deveco/sdk"
+            echo "OHOS_SDK_HOME=$deveco/sdk/default/openharmony"
+            echo "HVIGOR_USER_HOME=$RUNNER_TEMP/hvigor"
+            echo "npm_config_cache=$RUNNER_TEMP/npm-cache"
+          } >> "$GITHUB_ENV"
+          printf '%s\n' "$deveco/bin" "$deveco/tool/node/bin" >> "$GITHUB_PATH"
+      - name: Run native-service behavior tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work/harmony-release
+          node --test --test-reporter=tap harmonyos/tests/*.test.cjs | tee work/harmony-release/tests.log
+      - name: Build unsigned HAP
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash harmonyos/build.sh | tee work/harmony-release/build.log
+      - name: Verify and package release files
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 .github/scripts/harmony_release.py --tag "$RELEASE_TAG" --output work/harmony-release/package
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: harmonyos-release
+          path: work/harmony-release/package/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: harmonyos-release
+          path: release-package
+      - name: Upload assets then publish the prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-package/assets
+          sha256sum --check SHA256SUMS
+          if gh release view "$RELEASE_TAG" --json isDraft > ../release-state.json; then
+            python3 -c 'import json; assert json.load(open("../release-state.json"))["isDraft"], "Refusing to replace a published release"'
+            gh release edit "$RELEASE_TAG" --target "$SOURCE_COMMIT" --notes-file ../notes.md --prerelease --latest=false
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --target "$SOURCE_COMMIT" \
+              --title "PairShot HarmonyOS ${RELEASE_TAG#harmonyos-v} (unsigned preview)" \
+              --notes-file ../notes.md --draft --prerelease --latest=false
+          fi
+          gh release upload "$RELEASE_TAG" ./* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false

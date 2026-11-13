@@ -36,6 +36,8 @@ bash build.sh
 entry/build/default/outputs/default/entry-default-unsigned.hap
 ```
 
+GitHub 上推送与 `AppScope/app.json5` 版本一致的 `harmonyos-v*` 标签会触发 `.github/workflows/harmonyos.yml`：校验官方工具链下载摘要，运行测试并构建，再上传附件并发布为未签名预发布版。源码分支普通推送不会自动发布。构建任务只读仓库，发布任务在构建成功后使用仓库的 `GITHUB_TOKEN` 上传；不会将该标签标为正式最新版。
+
 ## 签名与安装
 
 源码默认不包含个人私钥、设备调试 profile 或 `signingConfig`，因此构建结果是 **未签名 HAP，不能直接作为已签名安装包安装到普通鸿蒙真机**。
