@@ -1,5 +1,6 @@
 import { abilityAccessCtrl, common } from '@kit.AbilityKit';
-import { CameraPhoto, LensInfo, SessionSummary, ShotRecord } from '../model/Models';
+import { pasteboard } from '@kit.BasicServicesKit';
+import { CameraPhoto, CapturedPhoto, LensInfo, SessionSummary, ShotRecord, MAX_PHONE_LENSES } from '../model/Models';
 import { CameraService } from './CameraService';
 import { PtpCamera, UsbCameraInfo } from './PtpCamera';
 import { SessionStore } from './SessionStore';
@@ -13,6 +14,12 @@ export class ViewState {
   selectedLensIds: string[] = [];
   previewLensId: string = '';
   previewAspectRatio: number = 3 / 4;
+  previewRatios: number[] = [];
+  previewReady: boolean = false;
+  captureMode: string = 'CONCURRENT';
+  concurrentAvailable: boolean = false;
+  concurrentReason: string = '';
+  cameraSummary: string = '';
   zoom: number = 1;
   minZoom: number = 1;
   maxZoom: number = 1;
@@ -48,6 +55,7 @@ export class PairShotController {
   private suspended: boolean = false;
   private disposed: boolean = false;
   private surfaceId: string = '';
+  private lensSurfaces: Map<string, string> = new Map<string, string>();
   private generation: number = 0;
   private linkGeneration: number = 0;
   private pollTimer: number = -1;
@@ -61,6 +69,7 @@ export class PairShotController {
   private connectionNumber: number = 0;
   private lifecycleStop: Promise<void> | undefined = undefined;
   private previewRestoreRequested: boolean = false;
+  private foregroundRefreshRequested: boolean = false;
   // A camera without a serial number is usable for import only during the
   // exact connection in which the record was made. This map is never persisted.
   private unverifiedConnections: Map<string, number> = new Map<string, number>();
@@ -72,6 +81,12 @@ export class PairShotController {
     this.store = new SessionStore(context);
     this.camera.onPreviewLayoutChanged = (ratio: number): void => {
       this.state.previewAspectRatio = ratio;
+      this.state.previewRatios = this.state.selectedLensIds.map((id: string): number => this.camera.getPreviewAspectRatio(id));
+      this.emit();
+    };
+    this.camera.onSessionError = (message: string): void => {
+      this.state.previewReady = false;
+      this.state.error = message;
       this.emit();
     };
   }
@@ -86,6 +101,12 @@ export class PairShotController {
     result.selectedLensIds = this.state.selectedLensIds.slice();
     result.previewLensId = this.state.previewLensId;
     result.previewAspectRatio = this.state.previewAspectRatio;
+    result.previewRatios = this.state.previewRatios.slice();
+    result.previewReady = this.state.previewReady;
+    result.captureMode = this.state.captureMode;
+    result.concurrentAvailable = this.state.concurrentAvailable;
+    result.concurrentReason = this.state.concurrentReason;
+    result.cameraSummary = this.state.cameraSummary;
     result.zoom = this.state.zoom;
     result.minZoom = this.state.minZoom;
     result.maxZoom = this.state.maxZoom;
@@ -131,9 +152,15 @@ export class PairShotController {
     } finally {
       this.state.busy = false;
       this.emit();
-      if (this.previewRestoreRequested && !this.suspended && !this.disposed) {
+      if ((this.previewRestoreRequested || this.foregroundRefreshRequested) && !this.suspended && !this.disposed) {
+        const refresh = this.foregroundRefreshRequested;
         this.previewRestoreRequested = false;
-        await this.resume();
+        this.foregroundRefreshRequested = false;
+        if (refresh) {
+          await this.resume();
+        } else {
+          await this.run(async () => this.restorePreview());
+        }
       }
     }
   }
@@ -148,7 +175,7 @@ export class PairShotController {
       this.state.history = this.store.listSessions();
       this.refreshUsbInternal();
       await this.requestCameraPermission();
-      this.state.status = this.state.permissionGranted ? '选择镜头后拍摄；双镜头会依次拍摄' : '请授权摄像头以使用手机拍摄';
+      this.state.status = this.state.permissionGranted ? '选择镜头；多镜头默认使用系统支持的并发拍摄' : '请授权摄像头以使用手机拍摄';
     });
   }
 
@@ -162,6 +189,7 @@ export class PairShotController {
       return;
     }
     this.state.lenses = this.camera.listCameras();
+    this.state.cameraSummary = this.camera.getDiscoverySummary();
     this.state.selectedLensIds = this.state.selectedLensIds.filter((id: string) =>
       this.state.lenses.some((lens: LensInfo) => lens.id === id));
     if (this.state.selectedLensIds.length === 0 && this.state.lenses.length > 0) {
@@ -182,6 +210,9 @@ export class PairShotController {
 
   async attachSurface(surfaceId: string): Promise<void> {
     this.surfaceId = surfaceId;
+    if (this.state.selectedLensIds.length > 0) {
+      this.lensSurfaces.set(this.state.selectedLensIds[0], surfaceId);
+    }
     if (this.state.busy && !this.suspended) {
       this.previewRestoreRequested = true;
     }
@@ -191,23 +222,130 @@ export class PairShotController {
     await this.run(async () => this.restorePreview());
   }
 
+  async attachLensSurface(lensId: string, surfaceId: string): Promise<void> {
+    if (this.state.selectedLensIds.indexOf(lensId) < 0 || !surfaceId) {
+      return;
+    }
+    this.lensSurfaces.set(lensId, surfaceId);
+    if (lensId === this.state.selectedLensIds[0]) {
+      this.surfaceId = surfaceId;
+    }
+    if (this.state.busy && !this.suspended) {
+      this.previewRestoreRequested = true;
+      return;
+    }
+    if (this.initialized && !this.suspended) {
+      await this.run(async () => this.restorePreview());
+    }
+  }
+
+  detachLensSurface(lensId: string, surfaceId: string = ''): void {
+    if (surfaceId && this.lensSurfaces.get(lensId) !== surfaceId) {
+      return;
+    }
+    this.lensSurfaces.delete(lensId);
+    if (this.state.selectedLensIds.indexOf(lensId) >= 0) {
+      this.state.previewReady = false;
+      if (lensId === this.state.selectedLensIds[0]) {
+        this.surfaceId = '';
+      }
+      this.camera.stop().catch((error: Error): void => {
+        this.state.error = error.message;
+        this.emit();
+      });
+      this.state.status = '预览画面已释放，等待重新创建';
+      this.emit();
+    }
+  }
+
+  async refreshCameras(): Promise<void> {
+    await this.run(async () => {
+      this.requireNoPending();
+      if (!this.state.permissionGranted) {
+        throw new Error('请先授权摄像头');
+      }
+      await this.camera.stop();
+      this.state.lenses = this.camera.listCameras();
+      this.state.cameraSummary = this.camera.getDiscoverySummary();
+      this.state.selectedLensIds = this.state.selectedLensIds.filter((id: string): boolean =>
+        this.state.lenses.some((lens: LensInfo): boolean => lens.id === id));
+      if (this.state.selectedLensIds.length === 0 && this.state.lenses.length > 0) {
+        this.state.selectedLensIds = [this.state.lenses[0].id];
+      }
+      this.emit();
+      await this.restorePreview();
+    });
+  }
+
+  async copyCameraDiagnostics(): Promise<void> {
+    await this.run(async () => {
+      const report = this.camera.getDiagnosticReport() + '\n拍摄模式：' + this.state.captureMode +
+        '\n所选镜头：' + this.state.selectedLensIds.join(', ') + '\n当前并发结果：' +
+        (this.state.concurrentReason || '能力查询通过或单镜头');
+      pasteboard.getSystemPasteboard().setDataSync(pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, report));
+      this.state.status = '镜头诊断已复制，可用于检查物理镜头枚举、过滤和并发能力';
+    });
+  }
+
+  async setCaptureMode(mode: string): Promise<void> {
+    await this.run(async () => {
+      this.requireNoPending();
+      if (this.state.linked) {
+        throw new Error('请先停止联动再切换多镜头拍摄方式');
+      }
+      if (mode !== 'CONCURRENT' && mode !== 'SEQUENTIAL') {
+        throw new Error('未知的多镜头拍摄方式');
+      }
+      this.state.captureMode = mode;
+      this.state.previewReady = false;
+      await this.restorePreview();
+    });
+  }
+
   private async restorePreview(): Promise<void> {
-    if (this.suspended || this.disposed || !this.state.permissionGranted || !this.surfaceId ||
+    this.state.previewReady = false;
+    if (this.suspended || this.disposed || !this.state.permissionGranted ||
       this.state.selectedLensIds.length === 0) {
       return;
     }
-    const id = this.state.selectedLensIds[0];
-    await this.camera.startPreview(id, this.surfaceId);
+    const ids = this.state.selectedLensIds.slice();
+    const id = ids[0];
+    const firstSurface = this.lensSurfaces.get(id) || this.surfaceId;
+    this.state.concurrentReason = ids.length > 1 ? this.camera.getConcurrentSupport(ids) : '';
+    this.state.concurrentAvailable = ids.length > 1 && this.state.concurrentReason.length === 0;
+    const concurrent = ids.length > 1 && this.state.captureMode === 'CONCURRENT';
+    if (concurrent && !this.state.concurrentAvailable) {
+      if (firstSurface) {
+        await this.camera.startPreview(id, firstSurface);
+      }
+      this.state.error = this.state.concurrentReason;
+      this.state.status = '当前组合无法并发拍照，可更换镜头组合或手动选择顺序拍摄';
+      return;
+    }
+    const surfaces = ids.map((lens: string): string => this.lensSurfaces.get(lens) || (lens === id ? firstSurface : ''));
+    if (!firstSurface || (concurrent && surfaces.some((surface: string): boolean => !surface))) {
+      this.state.status = '正在等待镜头预览画面创建';
+      return;
+    }
+    if (concurrent) {
+      await this.camera.startConcurrent(ids, surfaces);
+    } else {
+      await this.camera.startPreview(id, firstSurface);
+    }
     if (this.suspended || this.disposed) {
       await this.camera.stop();
       return;
     }
     this.state.previewLensId = id;
     this.state.previewAspectRatio = this.camera.getPreviewAspectRatio();
+    this.state.previewRatios = ids.map((lens: string): number => this.camera.getPreviewAspectRatio(lens));
     const range = this.camera.getZoomRange();
     this.state.minZoom = range.length > 0 ? range[0] : 1;
     this.state.maxZoom = range.length > 1 ? range[1] : this.state.minZoom;
     this.state.zoom = this.camera.setZoom(Math.min(this.state.maxZoom, Math.max(this.state.minZoom, this.state.zoom)));
+    this.state.previewReady = true;
+    this.state.status = concurrent ? `${ids.length} 路并发会话就绪；快门会并发提交` :
+      (ids.length > 1 ? '顺序拍摄就绪；镜头会依次曝光' : '单镜头已就绪');
   }
 
   async selectLens(id: string): Promise<void> {
@@ -220,19 +358,22 @@ export class PairShotController {
       if (current.indexOf(id) >= 0) {
         this.state.selectedLensIds = current.filter((value: string) => value !== id);
       } else {
-        if (current.length >= 2) {
-          throw new Error('最多选择两枚镜头，请先取消一枚');
+        if (current.length >= MAX_PHONE_LENSES) {
+          throw new Error(`最多选择 ${MAX_PHONE_LENSES} 枚镜头，请先取消一枚`);
         }
         this.state.selectedLensIds = current.concat([id]);
       }
       this.state.zoom = 1;
+      this.state.previewReady = false;
+      this.surfaceId = this.lensSurfaces.get(this.state.selectedLensIds[0]) || '';
+      await this.camera.stop();
+      this.emit();
       if (this.state.selectedLensIds.length === 0) {
         await this.camera.stop();
         this.state.previewLensId = '';
         this.state.status = '请选择至少一枚手机镜头';
       } else {
         await this.restorePreview();
-        this.state.status = this.state.selectedLensIds.length === 2 ? '已选双镜头；每次快门会依次拍摄并归为一组' : '单镜头已就绪';
       }
     });
   }
@@ -310,6 +451,10 @@ export class PairShotController {
     }
     if (this.state.selectedLensIds.length === 0 || this.surfaceId.length === 0) {
       throw new Error('请选择镜头并等待预览就绪');
+    }
+    if (this.state.selectedLensIds.length > 1 && this.state.captureMode === 'CONCURRENT' &&
+      (!this.state.previewReady || !this.camera.isConcurrentReady(this.state.selectedLensIds))) {
+      throw new Error(this.state.concurrentReason || '请等待全部并发镜头就绪，未发出快门');
     }
   }
 
@@ -401,6 +546,21 @@ export class PairShotController {
   private async capturePhones(shot: ShotRecord, token: number): Promise<string> {
     const requestedZoom = this.state.zoom;
     try {
+      shot.phoneCaptureMode = shot.expectedLensIds.length > 1 ? this.state.captureMode : 'SINGLE';
+      this.store.save();
+      if (shot.expectedLensIds.length > 1 && this.state.captureMode === 'CONCURRENT') {
+        this.checkActive(token);
+        if (shot.mode !== 'PHONE_ONLY' && !this.state.linked) {
+          throw new Error('联动已停止，未继续拍摄');
+        }
+        this.state.status = `正在并发拍摄 ${shot.expectedLensIds.length} 枚镜头`;
+        this.emit();
+        const failures = await this.camera.captureConcurrent(async (photo: CapturedPhoto): Promise<void> => {
+          await this.store.addPhonePhoto(shot, photo);
+          this.emit();
+        });
+        return failures.join('；');
+      }
       for (let i = 0; i < shot.expectedLensIds.length; i++) {
         this.checkActive(token);
         if (shot.mode !== 'PHONE_ONLY' && !this.state.linked) {
@@ -409,7 +569,7 @@ export class PairShotController {
         const id = shot.expectedLensIds[i];
         this.state.status = '正在拍摄手机镜头 ' + (i + 1).toString() + '/' + shot.expectedLensIds.length.toString();
         this.emit();
-        await this.camera.startPreview(id, this.surfaceId);
+        await this.camera.startPreview(id, this.lensSurfaces.get(id) || this.surfaceId);
         this.state.previewLensId = id;
         this.state.previewAspectRatio = this.camera.getPreviewAspectRatio();
         this.emit();
@@ -419,6 +579,7 @@ export class PairShotController {
         const max = range.length > 1 ? range[1] : min;
         this.camera.setZoom(Math.max(min, Math.min(max, requestedZoom)));
         const photo = await this.camera.capture();
+        photo.captureMode = shot.expectedLensIds.length > 1 ? 'SEQUENTIAL' : 'SINGLE';
         // Preserve an already exposed photograph even if backgrounding happens
         // just after the camera's completion callback.
         await this.store.addPhonePhoto(shot, photo);
@@ -841,6 +1002,7 @@ export class PairShotController {
       this.state.error = this.errorText(error as Error);
     }
     this.state.previewLensId = '';
+    this.state.previewReady = false;
     this.state.cameraLabel = '';
     this.emit();
   }
@@ -848,6 +1010,7 @@ export class PairShotController {
   async suspend(): Promise<void> {
     this.suspended = true;
     this.previewRestoreRequested = false;
+    this.foregroundRefreshRequested = false;
     this.generation += 1;
     this.connectionNumber += 1;
     if (this.state.busy || this.scanning) {
@@ -882,15 +1045,18 @@ export class PairShotController {
       return;
     }
     if (this.state.busy) {
-      this.previewRestoreRequested = true;
+      this.foregroundRefreshRequested = true;
       return;
     }
     await this.run(async () => {
+      await this.camera.stop();
+      this.state.previewReady = false;
       const manager = abilityAccessCtrl.createAtManager();
       const granted = await manager.checkAccessToken(this.context.applicationInfo.accessTokenId, 'ohos.permission.CAMERA');
       this.state.permissionGranted = granted === abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED;
       if (this.state.permissionGranted) {
         this.state.lenses = this.camera.listCameras();
+        this.state.cameraSummary = this.camera.getDiscoverySummary();
         this.state.selectedLensIds = this.state.selectedLensIds.filter((id: string) =>
           this.state.lenses.some((lens: LensInfo) => lens.id === id));
         if (this.state.selectedLensIds.length === 0 && this.state.lenses.length > 0) {
@@ -899,8 +1065,11 @@ export class PairShotController {
         await this.restorePreview();
       }
       this.refreshUsbInternal();
-      this.state.status = this.state.mode === 'PHONE_ONLY' ?
-        '手机镜头已就绪；双镜头会依次拍摄' : '已返回前台；如需联动，请重新连接相机并开启';
+      if (!this.state.permissionGranted) {
+        this.state.status = '请重新授权摄像头';
+      } else if (this.state.mode !== 'PHONE_ONLY') {
+        this.state.status += '；如需 USB 联动，请重新连接相机并开启';
+      }
     });
   }
 

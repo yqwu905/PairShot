@@ -1,439 +1,256 @@
 import { common } from '@kit.AbilityKit';
-import { BusinessError } from '@kit.BasicServicesKit';
 import { camera } from '@kit.CameraKit';
-import { image } from '@kit.ImageKit';
-import { display } from '@kit.ArkUI';
 import { CapturedPhoto, LensInfo } from '../model/Models';
+import { CameraCatalog, ConcurrentDevicePlan } from './CameraCatalog';
+import { CameraChannel } from './CameraChannel';
 
-/** One camera session at a time. The caller persists each result before switching lenses. */
+/** Discovers actual CameraDevice objects and manages independent live camera channels. */
 export class CameraService {
   onPreviewLayoutChanged: ((ratio: number) => void) | undefined = undefined;
+  onSessionError: ((message: string) => void) | undefined = undefined;
   private manager: camera.CameraManager;
-  private input: camera.CameraInput | undefined = undefined;
-  private preview: camera.PreviewOutput | undefined = undefined;
-  private output: camera.PhotoOutput | undefined = undefined;
-  private session: camera.PhotoSession | undefined = undefined;
-  private device: camera.CameraDevice | undefined = undefined;
+  private catalog: CameraCatalog;
+  private catalogReady: boolean = false;
+  private channels: CameraChannel[] = [];
+  private lensIds: string[] = [];
+  private surfaces: string[] = [];
   private lifecycle: Promise<void> = Promise.resolve();
+  private lastStop: Promise<void> = Promise.resolve();
   private generation: number = 0;
-  private running: boolean = false;
-  private surfaceId: string = '';
-  private lensLabel: string = '';
-  private zoom: number = 1;
-  private zoomRange: number[] = [1, 1];
-  private previewAspectRatio: number = 3 / 4;
-  private pendingResolve: ((photo: CapturedPhoto) => void) | undefined = undefined;
-  private pendingReject: ((error: Error) => void) | undefined = undefined;
-  private captureTimer: number = -1;
-  private captureSequence: number = 0;
-  private pendingPhoto: CapturedPhoto | undefined = undefined;
-  private displaySubscribed: boolean = false;
-  private displayCallback: () => void = (): void => {
-    this.updatePreviewRotation();
-  };
+  private groupReady: boolean = false;
+  private captureInProgress: boolean = false;
 
   constructor(context: common.UIAbilityContext) {
     this.manager = camera.getCameraManager(context);
+    this.catalog = new CameraCatalog(this.manager);
   }
 
   listCameras(): LensInfo[] {
-    const result: LensInfo[] = [];
-    const devices = this.manager.getSupportedCameras();
-    for (let index = 0; index < devices.length; index++) {
-      const device = devices[index];
-      if (!this.manager.getSupportedSceneModes(device).includes(camera.SceneMode.NORMAL_PHOTO)) {
-        continue;
-      }
-      const capabilities = this.manager.getSupportedOutputCapability(device, camera.SceneMode.NORMAL_PHOTO);
-      if (!capabilities.photoProfiles.some((profile: camera.Profile): boolean =>
-        profile.format === camera.CameraFormat.CAMERA_FORMAT_JPEG) || capabilities.previewProfiles.length === 0) {
-        continue;
-      }
-      const lens = new LensInfo();
-      lens.id = device.cameraId;
-      lens.position = device.cameraPosition;
-      lens.label = this.labelFor(device, index + 1);
-      result.push(lens);
+    const lenses = this.catalog.refresh();
+    this.catalogReady = true;
+    return lenses;
+  }
+
+  getDiscoverySummary(): string {
+    return this.catalog.summary();
+  }
+
+  getDiagnosticReport(): string {
+    return this.catalog.report();
+  }
+
+  getConcurrentSupport(lensIds: string[]): string {
+    if (lensIds.length < 2) {
+      return '';
     }
-    return result;
+    try {
+      this.ensureCatalog();
+      this.catalog.planConcurrent(lensIds);
+      return '';
+    } catch (error) {
+      const reason = (error as Error).message || String(error);
+      this.catalog.record('并发不可用：' + reason);
+      return reason;
+    }
+  }
+
+  private ensureCatalog(): void {
+    if (!this.catalogReady) {
+      this.listCameras();
+    }
   }
 
   getCurrentLensId(): string {
-    return this.running && this.device ? this.device.cameraId : '';
+    return this.channels.length > 0 ? this.channels[0].getCurrentLensId() : '';
+  }
+
+  getPreviewAspectRatio(lensId: string = ''): number {
+    const index = lensId ? this.lensIds.indexOf(lensId) : 0;
+    return index >= 0 && this.channels[index] ? this.channels[index].getPreviewAspectRatio() : 3 / 4;
   }
 
   getZoomRange(): number[] {
-    return this.zoomRange.slice();
-  }
-
-  getPreviewAspectRatio(): number {
-    return this.previewAspectRatio;
+    if (this.channels.length === 0) {
+      return [1, 1];
+    }
+    let min = 0;
+    let max = Number.MAX_VALUE;
+    for (const channel of this.channels) {
+      const range = channel.getZoomRange();
+      min = Math.max(min, range[0]);
+      max = Math.min(max, range[1]);
+    }
+    return min <= max ? [min, max] : [1, 1];
   }
 
   setZoom(value: number): number {
-    const session = this.session;
-    if (!session || !this.running) {
-      throw new Error('摄像头尚未就绪');
+    if (!Number.isFinite(value) || this.channels.length === 0) {
+      throw new Error('摄像头尚未就绪或变焦倍率无效');
     }
-    if (!Number.isFinite(value)) {
-      throw new Error('变焦倍率无效');
+    let primary = 1;
+    for (let index = 0; index < this.channels.length; index++) {
+      const channel = this.channels[index];
+      const range = channel.getZoomRange();
+      const applied = channel.setZoom(Math.max(range[0], Math.min(range[1], value)));
+      if (index === 0) {
+        primary = applied;
+      }
     }
-    const bounded = Math.max(this.zoomRange[0], Math.min(this.zoomRange[1], value));
-    session.setZoomRatio(bounded);
-    this.zoom = session.getZoomRatio();
-    return this.zoom;
+    return primary;
   }
 
   async startPreview(lensId: string, surfaceId: string): Promise<void> {
-    if (this.running && this.device?.cameraId === lensId && this.surfaceId === surfaceId) {
+    if (this.channels.length === 1 && this.getCurrentLensId() === lensId && this.surfaces[0] === surfaceId) {
       return;
     }
-    if (surfaceId.length === 0) {
-      throw new Error('预览画面尚未创建');
+    this.ensureCatalog();
+    const device = this.catalog.getDevice(lensId);
+    const caps = this.manager.getSupportedOutputCapability(device, camera.SceneMode.NORMAL_PHOTO);
+    const plan = new ConcurrentDevicePlan(device, camera.CameraConcurrentType.CAMERA_FULL_CAPABILITY, caps);
+    await this.openChannels([plan], [surfaceId], false);
+  }
+
+  async startConcurrent(lensIds: string[], surfaceIds: string[]): Promise<void> {
+    if (this.isConcurrentReady(lensIds) && this.surfaces.every((surface: string, index: number): boolean =>
+      surface === surfaceIds[index])) {
+      return;
     }
-    const generation = ++this.generation;
-    this.running = false;
-    this.rejectPending(new Error('镜头切换，拍摄已中止'));
+    this.ensureCatalog();
+    const plans = this.catalog.planConcurrent(lensIds);
+    await this.openChannels(plans, surfaceIds, true);
+  }
+
+  private async openChannels(plans: ConcurrentDevicePlan[], surfaceIds: string[], concurrent: boolean): Promise<void> {
+    if (surfaceIds.length !== plans.length || surfaceIds.some((surface: string): boolean => !surface) ||
+      new Set<string>(surfaceIds).size !== surfaceIds.length) {
+      throw new Error('每枚镜头需要独立的预览画面，请等待全部预览创建完成');
+    }
+    const token = ++this.generation;
+    this.groupReady = false;
+    for (const channel of this.channels) {
+      channel.stop().catch((): void => {});
+    }
     const operation = this.lifecycle.then(async (): Promise<void> => {
-      await this.releaseResources();
-      this.requireGeneration(generation);
+      await this.releaseChannels();
+      this.requireGeneration(token);
       try {
-        await this.openPreview(lensId, surfaceId, generation);
+        this.lensIds = plans.map((plan: ConcurrentDevicePlan): string => plan.device.cameraId);
+        this.surfaces = surfaceIds.slice();
+        for (let index = 0; index < plans.length; index++) {
+          this.requireGeneration(token);
+          const plan = plans[index];
+          const channel = new CameraChannel(this.manager, plan.device, plan.capabilities,
+            this.catalog.label(plan.device), concurrent ? plan.type : undefined);
+          this.channels.push(channel);
+          channel.onPreviewLayoutChanged = (): void => {
+            if (token === this.generation && this.onPreviewLayoutChanged) {
+              this.onPreviewLayoutChanged(this.getPreviewAspectRatio());
+            }
+          };
+          channel.onSessionError = (message: string): void => {
+            if (token !== this.generation) {
+              return;
+            }
+            this.groupReady = false;
+            this.catalog.record(`会话异常 ${plan.device.cameraId}：${message}`);
+            if (this.onSessionError) {
+              this.onSessionError(message);
+            }
+            this.stop().catch((): void => {});
+          };
+          await channel.startPreview(plan.device.cameraId, surfaceIds[index]);
+          this.requireGeneration(token);
+        }
+        this.groupReady = concurrent;
+        this.catalog.record((concurrent ? '并发会话已就绪：' : '单镜头已就绪：') + this.lensIds.join(', '));
       } catch (error) {
-        await this.releaseResources();
-        throw error as Error;
+        await this.releaseChannels();
+        const failure = error as Error;
+        this.catalog.record('打开镜头失败：' + failure.message);
+        throw failure;
       }
     });
     this.lifecycle = operation.catch((): void => {});
     await operation;
+  }
+
+  isConcurrentReady(lensIds: string[]): boolean {
+    return this.groupReady && lensIds.length >= 2 && this.channels.length === lensIds.length &&
+      lensIds.every((id: string, index: number): boolean => this.lensIds[index] === id &&
+        this.channels[index].getCurrentLensId() === id);
+  }
+
+  capture(): Promise<CapturedPhoto> {
+    if (this.channels.length !== 1) {
+      return Promise.reject(new Error('请等待单镜头就绪，或使用并发拍摄接口'));
+    }
+    return this.channels[0].capture();
+  }
+
+  async captureConcurrent(onPhoto: (photo: CapturedPhoto) => Promise<void>): Promise<string[]> {
+    if (this.captureInProgress) {
+      throw new Error('上一组并发照片仍在处理中，未重复发出快门');
+    }
+    if (!this.isConcurrentReady(this.lensIds)) {
+      throw new Error('多摄会话尚未全部就绪，未发出快门');
+    }
+    const token = this.generation;
+    this.captureInProgress = true;
+    try {
+      const ids = this.lensIds.slice();
+      // Submit all native requests before awaiting any JPEG or disk write.
+      const requests = this.channels.map((channel: CameraChannel): Promise<CapturedPhoto> => channel.capture());
+      const completions = requests.map(async (request: Promise<CapturedPhoto>, index: number): Promise<string> => {
+        try {
+          const photo = await request;
+          photo.captureMode = 'CONCURRENT';
+          await onPhoto(photo);
+          return '';
+        } catch (error) {
+          return ids[index] + '：' + (error as Error).message;
+        }
+      });
+      const results = await Promise.all(completions);
+      const failures = results.filter((message: string): boolean => message.length > 0);
+      if (failures.length > 0) {
+        this.catalog.record('并发拍摄部分失败：' + failures.join('；'));
+        if (token === this.generation) {
+          await this.stop();
+        } else {
+          await this.lastStop;
+        }
+      }
+      return failures;
+    } finally {
+      this.captureInProgress = false;
+    }
   }
 
   async stop(): Promise<void> {
     ++this.generation;
-    this.running = false;
-    this.rejectPending(new Error('摄像头已停止，未完成的拍摄已中止'));
+    this.groupReady = false;
+    const stopping = this.channels.map((channel: CameraChannel): Promise<void> => channel.stop());
     const operation = this.lifecycle.then(async (): Promise<void> => {
-      await this.releaseResources();
+      await Promise.all(stopping);
+      await this.releaseChannels();
     });
     this.lifecycle = operation.catch((): void => {});
+    this.lastStop = operation;
     await operation;
   }
 
-  capture(): Promise<CapturedPhoto> {
-    const output = this.output;
-    const device = this.device;
-    if (!this.running || !output || !device) {
-      return Promise.reject(new Error('摄像头尚未就绪，请重新打开预览'));
-    }
-    if (this.pendingResolve) {
-      return Promise.reject(new Error('上一张照片仍在处理中'));
-    }
-    const generation = this.generation;
-    const photo = new CapturedPhoto();
-    photo.lensId = device.cameraId;
-    photo.lensLabel = this.lensLabel;
-    photo.zoom = this.zoom;
-    // Wall-clock request time; deliberately not presented as sensor exposure time.
-    photo.capturedAt = Date.now();
-    const captureSequence = ++this.captureSequence;
-    return new Promise<CapturedPhoto>((resolve, reject): void => {
-      this.pendingResolve = resolve;
-      this.pendingReject = reject;
-      this.pendingPhoto = photo;
-      this.captureTimer = setTimeout((): void => {
-        if (captureSequence !== this.captureSequence || generation !== this.generation) {
-          return;
-        }
-        this.invalidate(new Error('等待 JPEG 照片超时，请重新打开预览'), generation);
-      }, 20000);
-      try {
-        const settings: camera.PhotoCaptureSetting = {
-          quality: camera.QualityLevel.QUALITY_LEVEL_HIGH,
-          rotation: output.getPhotoRotation(display.getDefaultDisplaySync().rotation * 90)
-        };
-        output.capture(settings).catch((error: Error): void => {
-          if (captureSequence === this.captureSequence && this.pendingResolve) {
-            this.invalidate(new Error(`拍摄请求失败：${error.message}`), generation);
-          }
-        });
-      } catch (error) {
-        this.invalidate(error as Error, generation);
-      }
-    });
+  private async releaseChannels(): Promise<void> {
+    const channels = this.channels.slice();
+    this.channels = [];
+    this.lensIds = [];
+    this.surfaces = [];
+    this.groupReady = false;
+    await Promise.all(channels.map((channel: CameraChannel): Promise<void> => channel.stop()));
   }
 
-  private async openPreview(lensId: string, surfaceId: string, generation: number): Promise<void> {
-    const devices = this.manager.getSupportedCameras();
-    const device = devices.find((item: camera.CameraDevice): boolean => item.cameraId === lensId);
-    if (!device) {
-      throw new Error('选中的镜头当前不可用');
-    }
-    if (!this.manager.getSupportedSceneModes(device).includes(camera.SceneMode.NORMAL_PHOTO)) {
-      throw new Error('此摄像头未开放普通照片模式');
-    }
-    const capabilities = this.manager.getSupportedOutputCapability(device, camera.SceneMode.NORMAL_PHOTO);
-    const photoProfile = this.choosePhotoProfile(capabilities.photoProfiles);
-    const previewProfile = this.choosePreviewProfile(capabilities.previewProfiles, photoProfile);
-    const input = this.manager.createCameraInput(device);
-    this.input = input;
-    this.device = device;
-    this.lensLabel = this.labelFor(device, devices.indexOf(device) + 1);
-    input.on('error', device, (error: BusinessError): void => {
-      this.invalidate(new Error(`摄像头异常（${error.code}）：${error.message}`), generation);
-    });
-    await input.open();
-    this.requireGeneration(generation);
-    const preview = this.manager.createPreviewOutput(previewProfile, surfaceId);
-    this.preview = preview;
-    const output = this.manager.createPhotoOutput(photoProfile);
-    this.output = output;
-    output.on('photoAvailable', (error: BusinessError, photo: camera.Photo): void => {
-      if (error && error.code !== 0) {
-        this.invalidate(new Error(`获取照片失败（${error.code}）：${error.message}`), generation);
-        if (photo) {
-          this.releasePhoto(photo).catch((): void => {});
-        }
-        return;
-      }
-      this.receivePhoto(photo, generation).catch((failure: Error): void => {
-        this.invalidate(failure, generation);
-      });
-    });
-    output.on('error', (error: BusinessError): void => {
-      this.invalidate(new Error(`照片输出异常（${error.code}）：${error.message}`), generation);
-    });
-    preview.on('error', (error: BusinessError): void => {
-      this.invalidate(new Error(`预览异常（${error.code}）：${error.message}`), generation);
-    });
-    const session = this.manager.createSession<camera.PhotoSession>(camera.SceneMode.NORMAL_PHOTO);
-    this.session = session;
-    session.on('error', (error: BusinessError): void => {
-      this.invalidate(new Error(`相机会话异常（${error.code}）：${error.message}`), generation);
-    });
-    session.beginConfig();
-    if (!session.canAddInput(input)) {
-      throw new Error('系统未允许使用此镜头，请关闭其他相机应用后重试');
-    }
-    session.addInput(input);
-    if (!session.canAddOutput(preview)) {
-      throw new Error('此镜头不支持所选预览配置');
-    }
-    session.addOutput(preview);
-    if (!session.canAddOutput(output)) {
-      throw new Error('此镜头不支持预览与 JPEG 拍摄组合');
-    }
-    session.addOutput(output);
-    await session.commitConfig();
-    this.requireGeneration(generation);
-    if (session.isFocusModeSupported(camera.FocusMode.FOCUS_MODE_CONTINUOUS_AUTO)) {
-      session.setFocusMode(camera.FocusMode.FOCUS_MODE_CONTINUOUS_AUTO);
-    }
-    if (session.isExposureModeSupported(camera.ExposureMode.EXPOSURE_MODE_CONTINUOUS_AUTO)) {
-      session.setExposureMode(camera.ExposureMode.EXPOSURE_MODE_CONTINUOUS_AUTO);
-    }
-    await session.start();
-    this.requireGeneration(generation);
-    this.running = true;
-    this.surfaceId = surfaceId;
-    const range = session.getZoomRatioRange();
-    this.zoomRange = range.length >= 2 && range[0] > 0 && range[1] >= range[0] ?
-      [range[0], range[1]] : [1, 1];
-    this.zoom = session.getZoomRatio();
-    this.updatePreviewRotation();
-    display.on('change', this.displayCallback);
-    this.displaySubscribed = true;
-  }
-
-  private async receivePhoto(photo: camera.Photo, generation: number): Promise<void> {
-    const sequence = this.captureSequence;
-    const pending = this.pendingPhoto;
-    let result: CapturedPhoto | undefined = undefined;
-    try {
-      if (generation === this.generation && pending && this.pendingResolve) {
-        const component = await photo.main.getComponent(image.ComponentType.JPEG);
-        if (component.byteBuffer.byteLength < 4) {
-          throw new Error('相机返回的 JPEG 数据为空');
-        }
-        const bytes = new Uint8Array(component.byteBuffer);
-        if (bytes[0] !== 0xFF || bytes[1] !== 0xD8) {
-          throw new Error('相机没有返回有效的 JPEG 图像');
-        }
-        // Copy before release: the component buffer belongs to the camera image.
-        pending.jpeg = component.byteBuffer.slice(0);
-        result = pending;
-      }
-    } finally {
-      await this.releasePhoto(photo);
-    }
-    if (result && sequence === this.captureSequence && generation === this.generation) {
-      const resolve = this.pendingResolve;
-      this.clearPending();
-      if (resolve) {
-        resolve(result);
-      }
-    }
-  }
-
-  private async releasePhoto(photo: camera.Photo): Promise<void> {
-    try {
-      await photo.main.release();
-    } finally {
-      await photo.release();
-    }
-  }
-
-  private updatePreviewRotation(): void {
-    const preview = this.preview;
-    if (!preview) {
-      return;
-    }
-    try {
-      const rotation = preview.getPreviewRotation(display.getDefaultDisplaySync().rotation * 90);
-      preview.setPreviewRotation(rotation, false);
-      const profile = preview.getActiveProfile();
-      const ratio = rotation === camera.ImageRotation.ROTATION_90 ||
-        rotation === camera.ImageRotation.ROTATION_270 ? profile.size.height / profile.size.width :
-        profile.size.width / profile.size.height;
-      if (ratio !== this.previewAspectRatio) {
-        this.previewAspectRatio = ratio;
-        if (this.onPreviewLayoutChanged) {
-          this.onPreviewLayoutChanged(ratio);
-        }
-      }
-    } catch (error) {
-      // Rotation must not tear down an otherwise valid camera session.
-    }
-  }
-
-  private invalidate(error: Error, generation: number): void {
-    if (generation !== this.generation) {
-      return;
-    }
-    this.rejectPending(error);
-    // A timed-out/error capture must never satisfy a later shutter request.
-    this.stop().catch((): void => {});
-  }
-
-  private rejectPending(error: Error): void {
-    const reject = this.pendingReject;
-    this.clearPending();
-    if (reject) {
-      reject(error);
-    }
-  }
-
-  private clearPending(): void {
-    if (this.captureTimer >= 0) {
-      clearTimeout(this.captureTimer);
-      this.captureTimer = -1;
-    }
-    this.pendingResolve = undefined;
-    this.pendingReject = undefined;
-    this.pendingPhoto = undefined;
-  }
-
-  private requireGeneration(generation: number): void {
-    if (generation !== this.generation) {
+  private requireGeneration(token: number): void {
+    if (token !== this.generation) {
       throw new Error('摄像头初始化已取消');
     }
-  }
-
-  private async releaseResources(): Promise<void> {
-    this.running = false;
-    this.surfaceId = '';
-    this.zoomRange = [1, 1];
-    if (this.displaySubscribed) {
-      try { display.off('change', this.displayCallback); } catch (error) {}
-      this.displaySubscribed = false;
-    }
-    const session = this.session;
-    const preview = this.preview;
-    const output = this.output;
-    const input = this.input;
-    const device = this.device;
-    this.session = undefined;
-    this.preview = undefined;
-    this.output = undefined;
-    this.input = undefined;
-    this.device = undefined;
-    if (session) {
-      try { session.off('error'); } catch (error) {}
-      try { await session.stop(); } catch (error) {}
-    }
-    if (output) {
-      try { output.off('photoAvailable'); } catch (error) {}
-      try { output.off('error'); } catch (error) {}
-      try { await output.release(); } catch (error) {}
-    }
-    if (preview) {
-      try { preview.off('error'); } catch (error) {}
-      try { await preview.release(); } catch (error) {}
-    }
-    if (session) {
-      try { await session.release(); } catch (error) {}
-    }
-    if (input) {
-      if (device) {
-        try { input.off('error', device); } catch (error) {}
-      }
-      try { await input.close(); } catch (error) {}
-    }
-  }
-
-  private choosePhotoProfile(profiles: camera.Profile[]): camera.Profile {
-    const jpeg = profiles.filter((profile: camera.Profile): boolean =>
-      profile.format === camera.CameraFormat.CAMERA_FORMAT_JPEG);
-    if (jpeg.length === 0) {
-      throw new Error('此镜头未开放 JPEG 拍摄');
-    }
-    // Prefer ordinary 4:3 photos around 12 MP instead of a vendor-specific high-resolution mode.
-    jpeg.sort((left: camera.Profile, right: camera.Profile): number =>
-      this.photoScore(left) - this.photoScore(right));
-    return jpeg[0];
-  }
-
-  private photoScore(profile: camera.Profile): number {
-    const width = profile.size.width;
-    const height = profile.size.height;
-    const pixels = width * height;
-    return Math.abs(width / height - 4 / 3) * 50 + Math.abs(pixels - 12000000) / 12000000;
-  }
-
-  private choosePreviewProfile(profiles: camera.Profile[], photo: camera.Profile): camera.Profile {
-    if (profiles.length === 0) {
-      throw new Error('此镜头未开放预览');
-    }
-    const options = profiles.slice();
-    const ratio = photo.size.width / photo.size.height;
-    options.sort((left: camera.Profile, right: camera.Profile): number =>
-      this.previewScore(left, ratio) - this.previewScore(right, ratio));
-    return options[0];
-  }
-
-  private previewScore(profile: camera.Profile, ratio: number): number {
-    const pixels = profile.size.width * profile.size.height;
-    const formatPenalty = profile.format === camera.CameraFormat.CAMERA_FORMAT_YUV_420_SP ? 0 : 100;
-    return Math.abs(profile.size.width / profile.size.height - ratio) * 50 +
-      Math.abs(pixels - 1280 * 960) / (1280 * 960) + formatPenalty;
-  }
-
-  private labelFor(device: camera.CameraDevice, index: number): string {
-    let position = '摄像头';
-    if (device.cameraPosition === camera.CameraPosition.CAMERA_POSITION_BACK) {
-      position = '后置';
-    } else if (device.cameraPosition === camera.CameraPosition.CAMERA_POSITION_FRONT) {
-      position = '前置';
-    }
-    let type = '镜头';
-    if (device.cameraType === camera.CameraType.CAMERA_TYPE_WIDE_ANGLE) {
-      type = '广角';
-    } else if (device.cameraType === camera.CameraType.CAMERA_TYPE_ULTRA_WIDE) {
-      type = '超广角';
-    } else if (device.cameraType === camera.CameraType.CAMERA_TYPE_TELEPHOTO) {
-      type = '长焦';
-    } else if (device.cameraType === camera.CameraType.CAMERA_TYPE_TRUE_DEPTH) {
-      type = '景深';
-    }
-    return `${position}${type} ${index}`;
   }
 }

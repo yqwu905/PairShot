@@ -1,13 +1,15 @@
 # PairShot · 原生鸿蒙版
 
-原生 ArkTS / ArkUI 工程，包名 `com.pairshot.capture`，开发测试版本 `0.1.1`。面向 HarmonyOS 5.1 / API 18 及以上的手机和平板；不是 Android APK 的格式转换。
+原生 ArkTS / ArkUI 工程，包名 `com.pairshot.capture`，开发测试版本 `0.2.0`。面向 HarmonyOS 5.1 / API 18 及以上的手机和平板；不是 Android APK 的格式转换。DevEco 工程入口和源码压缩包的对应关系见 [DEVECO.md](DEVECO.md)。
 
 0.1.1 修复了旧包名含有 AppGallery Connect 保留段 `harmony` 的问题。请使用新包名 `com.pairshot.capture` 注册应用并重新生成对应的签名 Profile；为旧包名生成的 Profile 不能用于新包。发布流程会检查包名格式及 `oh`、`ohos`、`harmony`、`harmonyos`、`openharmony`、`system` 等保留段。规则来源：[华为创建应用文档](https://developer.huawei.com/consumer/cn/doc/App/agc-help-create-app-0000002247955506/)。
 
 ## 功能
 
-- **仅手机拍摄**：枚举系统向应用开放的普通拍照镜头，实时预览、JPEG 拍摄、按实际范围变焦，最多选择两个镜头。
-- **双镜头顺序拍摄**：逐个打开镜头，每张拍完立即保存。不依赖系统声明双摄并发支持，不保证同时曝光；无法绕过系统隐藏的物理镜头。
+- **物理镜头发现**：合并基础相机、按位置/类型查询的相机，以及运行系统提供的 `getCameraDevices`（API 23）和 `constituentCameraDevices`（API 24）结果。按真实 cameraId 去重，并复用返回的 CameraDevice 对象打开镜头。最多选择四枚镜头。
+- **多镜头并发拍照**：默认多选后调用 `getCameraConcurrentInfos`，按每枚相机在普通拍照模式下的并发能力选择预览和 JPEG 配置，再以系统返回的并发类型打开独立 CameraInput/PhotoSession。全部会话就绪后，在等待任何照片前向所有 PhotoOutput 提交快门。每枚镜头有独立预览、回调、超时和资源释放。
+- **显式顺序拍照**：也可手动选择顺序模式，逐个打开并拍摄，每张立即保存。不支持并发 JPEG 的组合不会自动伪装为并发；界面会显示原因，允许更换组合或选择顺序模式。
+- **镜头诊断**：可复制基础/扩展查询结果、物理组成、被过滤的原因、所选组合的并发能力及会话错误，便于核验 Mate 90 等真机开放的镜头。
 - **USB / OTG 相机**：查找标准 Still Image / PTP 接口，由系统请求 USB 访问授权；显示品牌型号及协议错误。
 - **手机 → 相机**：提交手机和相机拍摄请求。精确匹配第一代 Nikon Z6、厂商 ID 和声明的 `0x9207` 指令时使用尼康存储卡快门；其他型号仅在声明标准 `InitiateCapture` 时尝试遥控快门。失败不自动重发快门。
 - **相机 → 手机**：开启联动时读取存储卡基线，之后通过新增对象扫描触发手机跟拍。它是相机生成文件之后的延迟跟拍，不是快门按下瞬间的同步曝光。
@@ -16,6 +18,10 @@
 - **本地记录**：批次、历史记录、原子清单保存、未完成拍摄恢复。进入后台停止联动并释放设备，返回前台需重新连接相机和开启联动。
 
 界面只展示请求倍率；倍率可能涉及数字裁切，不能当作光学焦距。系统公开的摄像头 ID 不一定对应每一枚物理镜头。JPEG 中的方向由 CameraKit 处理，清单中的 `capturedAt` 是请求时刻，不是传感器曝光时刻。
+
+华为当前[多摄同开说明](https://developer.huawei.com/consumer/cn/doc/HarmonyOS-Guides/camera-concurrent-open/)仍将“前置/后置相机同时拍照”标为待开放。因此本版只在真机返回完整的 JPEG 并发能力且实际会话建立成功后开放并发快门，不保证 Mate 90 或任意后置物理镜头组合必然可并发。多路快门是并发提交，不承诺传感器在同一时刻曝光。
+
+最低系统仍为 API 18。为兼容旧系统，新增 API 的准确公开签名放在带运行时检测的兼容接口中；运行系统没有 API 23/24 方法或属性时，会继续使用基础和 API 18 的按类型查询。没有修改 SDK 声明，也不猜测隐藏相机 ID。接口定义参考：[CameraManager](https://developer.huawei.com/consumer/cn/doc/harmonyos-references/arkts-apis-camera-cameramanager/)、[CameraDevice](https://developer.huawei.com/consumer/cn/doc/harmonyos-references/arkts-apis-camera-i/)。
 
 ## 构建
 
@@ -48,7 +54,7 @@ GitHub 上推送与 `AppScope/app.json5` 版本一致的 `harmonyos-v*` 标签�
 
 ## 使用
 
-1. 仅手机模式下授权摄像头，选择一枚或两枚镜头，调节倍率后点击“手机拍照”。双镜头会切换预览并依次拍摄。
+1. 仅手机模式下授权摄像头，选择一至四枚镜头。多选默认并发模式；所有独立预览就绪后可点击“并发拍照”。系统不支持此组合时查看提示，选择其他组合，或手动切为“顺序拍照”。
 2. USB 联动时用数据线和 OTG 连接相机，切换到 PTP 模式。点击刷新，选择“连接并授权”，然后开启联动。建立基线期间不要拍摄。
 3. 手机主导时每次只发起一组拍摄，等待本组完成再继续；不要同时独立按相机快门，避免基于新增文件的配对产生歧义。相机主导时按相机快门，应用发现新照片后跟拍。
 4. 点击“复制本批次相机原片”，完成后“打包照片 ZIP”，选择系统允许保存的位置。导入时会停止联动，不删除或修改相机原片。
@@ -64,7 +70,7 @@ phone/<shot-id>/<encoded-camera-id>.jpg
 camera/<shot-id>/<handle>_<safe-filename>
 ```
 
-清单包含平台、模式、请求时刻、请求倍率、照片大小、SHA-256 和缺失/失败状态。使用不改变原片内容的 ZIP STORE 流式归档；经典 ZIP 限制为整包小于 4 GiB、最多 65,535 项，超过限制会报错。
+清单包含平台、联动模式、手机拍摄方式（`SINGLE` / `SEQUENTIAL` / `CONCURRENT`）、请求时刻、请求倍率、照片大小、SHA-256 和缺失/失败状态。收到 `frameShutter` 时保存 API 返回的快门时间戳 `shutterTimestampMs`；0 表示未收到，不能据此推断经过校准的曝光同步精度。旧批次缺少新字段时仍可读取。使用不改变原片内容的 ZIP STORE 流式归档；经典 ZIP 限制为整包小于 4 GiB、最多 65,535 项，超过限制会报错。
 
 ## 自动化验证与真机边界
 
@@ -78,7 +84,7 @@ node --test tests/*.test.cjs
 
 构建通过只能证明 ArkTS、资源与 HAP 打包通过。当前环境没有 USB 真机直通或鸿蒙模拟器，以下仍需真机验收：
 
-- 手机镜头枚举、前后摄预览方向、照片方向、变焦范围、双镜头切换后的成片；
+- 基础和扩展物理镜头枚举、逐路预览及成片方向、并发能力、并发拍照组合、倍率范围和顺序回退；
 - 摄像头/USB 权限拒绝与重试、设备忙、USB 拔线、切后台、重新进入应用；
 - Nikon Z6 及其他声明支持的 PTP 相机：远程快门、机身快门、RAW+JPEG、长写卡延迟；
 - 原片分块导入、存储空间不足、历史恢复、系统保存器取消与保存；

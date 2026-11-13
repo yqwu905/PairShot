@@ -1,7 +1,7 @@
 import { common } from '@kit.AbilityKit';
 import { fileIo as fs, hash, picker } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
-import { CameraPhoto, CapturedPhoto, PhonePhoto, SessionRecord, SessionSummary, ShotRecord } from '../model/Models';
+import { CameraPhoto, CapturedPhoto, PhonePhoto, SessionRecord, SessionSummary, ShotRecord, MAX_PHONE_LENSES } from '../model/Models';
 
 const MAX_ZIP_SIZE: number = 0xFFFFFFFF;
 const CHUNK_SIZE: number = 65536;
@@ -337,7 +337,7 @@ export class SessionStore {
   createShot(mode: string, lensIds: string[], cameraIdentity: string = ''): ShotRecord {
     this.assertMutable();
     requireValue(mode === 'PHONE_ONLY' || mode === 'PHONE_TO_CAMERA' || mode === 'CAMERA_TO_PHONE', '拍摄模式无效');
-    requireValue(lensIds.length > 0 && lensIds.length <= 2, '请选择一枚或两枚镜头');
+    requireValue(lensIds.length > 0 && lensIds.length <= MAX_PHONE_LENSES, `请选择 1 至 ${MAX_PHONE_LENSES} 枚镜头`);
     const shot = new ShotRecord();
     shot.id = this.nextId();
     shot.createdAt = Date.now();
@@ -377,6 +377,8 @@ export class SessionStore {
     record.lensLabel = photo.lensLabel;
     record.zoom = photo.zoom;
     record.capturedAt = photo.capturedAt;
+    record.captureMode = photo.captureMode || 'SINGLE';
+    record.shutterTimestampMs = Number.isFinite(photo.shutterTimestampMs) ? photo.shutterTimestampMs : 0;
     record.relativePath = phoneRelative(shot, photo.lensId);
     record.bytes = photo.jpeg.byteLength;
     const path = `${this.sessionPath(this.current.id)}/${record.relativePath}`;

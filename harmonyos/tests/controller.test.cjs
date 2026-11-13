@@ -73,7 +73,9 @@ function setup(options = {}) {
   const events = [];
   const observedStates = [];
   const permissions = { granted: options.permission !== false };
-  const phones = { currentLens: '', zoom: 1, captures: [], stops: 0, captureHook: null, previewHook: null };
+  const phones = { currentLens: '', activeIds: [], concurrentReason: '', zoom: 1, captures: [], stops: 0,
+    captureHook: null, previewHook: null, concurrentStarts: [] };
+  const clipboard = { text: '' };
   const usb = {
     connected: false, identity: 'camera-A:serial-A', reliable: true, supportsCapture: true,
     handles: [], photos: new Map(), captures: 0, downloads: [], infos: [], lists: 0,
@@ -83,10 +85,14 @@ function setup(options = {}) {
     current: { id: 'session-1', shots: [] }, saved: [], sequence: 0, saveHook: null,
     damagedHandles: new Set(), verified: [],
   };
-  const lenses = ['back', 'front', 'tele'].map((id, position) => ({ id, label: id, position }));
+  const lenses = ['back', 'front', 'tele', 'ultra'].map((id, position) => ({ id, label: id, position }));
 
   class CameraService {
     listCameras() { return lenses; }
+    getDiscoverySummary() { return `Found ${lenses.length} cameras`; }
+    getDiagnosticReport() { return 'base=2; extended=1; filtered=0'; }
+    getConcurrentSupport() { return phones.concurrentReason; }
+    isConcurrentReady(ids) { return JSON.stringify(ids) === JSON.stringify(phones.activeIds); }
     getCurrentLensId() { return phones.currentLens; }
     getZoomRange() { return [1, phones.currentLens === 'front' ? 2 : 6]; }
     getPreviewAspectRatio() { return 3 / 4; }
@@ -95,8 +101,14 @@ function setup(options = {}) {
       events.push(['preview', id, surface]);
       if (phones.previewHook) await phones.previewHook(id);
       phones.currentLens = id;
+      phones.activeIds = [id];
     }
-    async stop() { phones.stops++; phones.currentLens = ''; events.push(['stop']); }
+    async startConcurrent(ids, surfaces) {
+      phones.concurrentStarts.push({ ids: [...ids], surfaces: [...surfaces] });
+      phones.activeIds = [...ids]; phones.currentLens = ids[0];
+      events.push(['concurrent-preview', ...ids]);
+    }
+    async stop() { phones.stops++; phones.currentLens = ''; phones.activeIds = []; events.push(['stop']); }
     async capture() {
       const id = phones.currentLens;
       phones.captures.push(id);
@@ -107,12 +119,28 @@ function setup(options = {}) {
       photo.capturedAt = clock.now; photo.jpeg = new Uint8Array([0xff, 0xd8, 1, 2]).buffer;
       return photo;
     }
+    async captureConcurrent(onPhoto) {
+      const ids = [...phones.activeIds];
+      return (await Promise.all(ids.map(async id => {
+        phones.captures.push(id); events.push(['capture', id]);
+        try {
+          if (phones.captureHook) await phones.captureHook(id);
+          const photo = new model.CapturedPhoto();
+          photo.lensId = id; photo.lensLabel = id; photo.captureMode = 'CONCURRENT';
+          photo.zoom = phones.zoom; photo.capturedAt = clock.now;
+          photo.jpeg = new Uint8Array([0xff, 0xd8, 1, 2]).buffer;
+          await onPhoto(photo);
+          return '';
+        } catch (error) { return `${id}: ${error.message}`; }
+      }))).filter(Boolean);
+    }
   }
 
   class PtpCamera {
     listDevices() { events.push(['usb-enumerate']); return [{ name: 'usb-1', label: 'Test camera' }]; }
     async connect(name) { events.push(['usb-connect', name]); usb.connected = true; return 'Test camera'; }
     async disconnect() { events.push(['usb-disconnect']); usb.connected = false; }
+    abort() { events.push(['usb-abort']); usb.connected = false; }
     isConnected() { return usb.connected; }
     getIdentity() { return usb.identity; }
     hasReliableIdentity() { return usb.reliable; }
@@ -157,6 +185,7 @@ function setup(options = {}) {
       const saved = Object.assign(new model.PhonePhoto(), {
         lensId: photo.lensId, lensLabel: photo.lensLabel, zoom: photo.zoom,
         capturedAt: photo.capturedAt, bytes: photo.jpeg.byteLength, sha256: 'a'.repeat(64),
+        captureMode: photo.captureMode, shutterTimestampMs: photo.shutterTimestampMs,
         relativePath: `phone/${shot.id}/${photo.lensId}.jpg`,
       });
       shot.phonePhotos.push(saved); events.push(['save-phone', shot.id, photo.lensId]); this.save();
@@ -191,6 +220,10 @@ function setup(options = {}) {
 
   class FakeDate extends Date { static now() { return clock.now; } }
   const { PairShotController } = transpile('services/PairShotController.ets', {
+    '@kit.BasicServicesKit': { pasteboard: {
+      MIMETYPE_TEXT_PLAIN: 'text/plain', createData: (type, text) => ({ type, text }),
+      getSystemPasteboard: () => ({ setDataSync: data => { clipboard.text = data.text; } }),
+    } },
     '@kit.AbilityKit': { abilityAccessCtrl: {
       GrantStatus: { PERMISSION_GRANTED: 0 },
       createAtManager: () => ({
@@ -208,8 +241,12 @@ function setup(options = {}) {
   });
   const controller = new PairShotController({ applicationInfo: { accessTokenId: 1 } }, state => observedStates.push(state));
   const h = {
-    controller, clock, events, observedStates, permissions, phones, usb, store,
-    async ready() { await controller.initialize(); await controller.attachSurface('surface-1'); },
+    controller, clock, events, observedStates, permissions, phones, usb, store, clipboard,
+    async ready() {
+      await controller.initialize(); await controller.attachSurface('surface-1');
+      // Legacy regression cases explicitly opt into the retained sequential mode.
+      if (options.captureMode !== 'CONCURRENT') await controller.setCaptureMode('SEQUENTIAL');
+    },
     async link(mode = 'CAMERA_TO_PHONE') {
       await controller.setMode(mode); await controller.connectUsb('usb-1'); await controller.startLink();
       assert.equal(controller.getState().linked, true, controller.getState().error);
@@ -574,4 +611,120 @@ test('import is rejected while a software shutter is waiting for its matching ca
   await h.controller.importPhotos();
   assert.deepEqual(h.usb.downloads.map(photo => photo.handle), [1]);
   assert.equal(h.store.current.shots[0].status, 'complete');
+});
+
+test('default concurrent mode waits for every independent surface and does not silently capture sequentially', async t => {
+  const h = await fixture(t, { captureMode: 'CONCURRENT' });
+  assert.equal(h.controller.getState().captureMode, 'CONCURRENT');
+  await h.controller.selectLens('front');
+  assert.equal(h.controller.getState().previewReady, false);
+  await h.controller.capture();
+  assert.deepEqual(h.phones.captures, []);
+  assert.equal(h.store.current.shots.length, 0);
+  await h.controller.attachLensSurface('front', 'surface-front');
+  assert.equal(h.controller.getState().previewReady, true);
+  assert.deepEqual(h.phones.concurrentStarts.at(-1), { ids: ['back', 'front'], surfaces: ['surface-1', 'surface-front'] });
+  await h.controller.capture();
+  const shot = h.store.current.shots[0];
+  assert.equal(shot.phoneCaptureMode, 'CONCURRENT');
+  assert.equal(shot.status, 'complete');
+  assert.deepEqual(plain(shot.phonePhotos.map(photo => photo.lensId)), ['back', 'front']);
+  assert.ok(shot.phonePhotos.every(photo => photo.captureMode === 'CONCURRENT'));
+});
+
+test('preview-only concurrent capability blocks all shutters until the user explicitly selects sequential mode', async t => {
+  const h = await fixture(t, { captureMode: 'CONCURRENT' });
+  h.phones.concurrentReason = 'No concurrent JPEG output';
+  await h.controller.selectLens('front');
+  await h.controller.attachLensSurface('front', 'front-surface');
+  await h.controller.capture();
+  assert.equal(h.controller.getState().concurrentAvailable, false);
+  assert.match(h.controller.getState().error, /No concurrent JPEG/);
+  assert.deepEqual(h.phones.captures, []);
+  assert.equal(h.store.current.shots.length, 0);
+  assert.equal(h.usb.captures, 0);
+  await h.controller.setCaptureMode('SEQUENTIAL');
+  await h.controller.capture();
+  assert.deepEqual(h.phones.captures, ['back', 'front']);
+  assert.equal(h.store.current.shots[0].phoneCaptureMode, 'SEQUENTIAL');
+});
+
+test('four-camera concurrency keeps all JPEGs in one record and triggers the external camera only once', async t => {
+  const h = await fixture(t, { captureMode: 'CONCURRENT' });
+  for (const id of ['front', 'tele', 'ultra']) {
+    await h.controller.selectLens(id);
+    await h.controller.attachLensSurface(id, `surface-${id}`);
+  }
+  assert.equal(h.controller.getState().previewReady, true);
+  await h.link('PHONE_TO_CAMERA');
+  await h.controller.capture();
+  assert.equal(h.usb.captures, 1);
+  assert.deepEqual(h.phones.captures, ['back', 'front', 'tele', 'ultra']);
+  assert.equal(h.store.current.shots.length, 1);
+  const shot = h.store.current.shots[0];
+  assert.equal(shot.phoneCaptureMode, 'CONCURRENT');
+  assert.equal(shot.phonePhotos.length, 4);
+  assert.equal(shot.status, 'pending');
+  await h.controller.capture();
+  assert.equal(h.usb.captures, 1, 'Pending pairing must not fire the external shutter again');
+});
+
+test('a failing concurrent lens preserves its peer and does not label the group complete', async t => {
+  const h = await fixture(t, { captureMode: 'CONCURRENT' });
+  await h.controller.selectLens('front');
+  await h.controller.attachLensSurface('front', 'surface-front');
+  h.phones.captureHook = async id => { if (id === 'front') throw new Error('Front capture failed'); };
+  await h.controller.capture();
+  const shot = h.store.current.shots[0];
+  assert.deepEqual(plain(shot.phonePhotos.map(photo => photo.lensId)), ['back']);
+  assert.equal(shot.phoneCaptureMode, 'CONCURRENT');
+  assert.equal(shot.status, 'incomplete');
+  assert.match(shot.error, /Front capture failed/);
+  assert.deepEqual(h.phones.captures, ['back', 'front']);
+});
+
+test('a stale surface-destroy callback cannot close a newer concurrent preview', async t => {
+  const h = await fixture(t, { captureMode: 'CONCURRENT' });
+  await h.controller.selectLens('front');
+  await h.controller.attachLensSurface('front', 'old-front');
+  await h.controller.attachLensSurface('front', 'new-front');
+  const stops = h.phones.stops;
+  h.controller.detachLensSurface('front', 'old-front');
+  assert.equal(h.phones.stops, stops);
+  assert.equal(h.controller.getState().previewReady, true);
+  h.controller.detachLensSurface('front', 'new-front');
+  assert.equal(h.controller.getState().previewReady, false);
+  await h.controller.capture();
+  assert.deepEqual(h.phones.captures, []);
+  await h.controller.attachLensSurface('front', 'replacement-front');
+  assert.equal(h.controller.getState().previewReady, true);
+});
+
+test('camera diagnostics copy exposes discovery and selection details without taking a photo', async t => {
+  const h = await fixture(t, { captureMode: 'CONCURRENT' });
+  await h.controller.copyCameraDiagnostics();
+  assert.match(h.clipboard.text, /base=2; extended=1/);
+  assert.match(h.clipboard.text, /CONCURRENT/);
+  assert.match(h.clipboard.text, /back/);
+  assert.deepEqual(h.phones.captures, []);
+  assert.equal(h.usb.captures, 0);
+});
+
+test('foreground return during a busy shot rechecks a revoked camera permission before restoring preview', async t => {
+  const h = await fixture(t, { captureMode: 'CONCURRENT' });
+  const gate = deferred();
+  h.phones.captureHook = () => gate.promise;
+  const capture = h.controller.capture();
+  await flush();
+  await h.controller.suspend();
+  h.permissions.granted = false;
+  await h.controller.resume();
+  gate.resolve();
+  await capture;
+  assert.equal(h.controller.getState().permissionGranted, false);
+  assert.equal(h.controller.getState().previewReady, false);
+  assert.equal(h.phones.currentLens, '');
+  const count = h.phones.captures.length;
+  await h.controller.capture();
+  assert.equal(h.phones.captures.length, count);
 });

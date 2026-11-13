@@ -3,15 +3,64 @@ import { PairShotController, ViewState } from '../services/PairShotController';
 import { CameraPhoto, LensInfo, ShotRecord, SessionSummary } from '../model/Models';
 import { UsbCameraInfo } from '../services/PtpCamera';
 
+@Component
+struct LensPreviewSurface {
+  @Prop lensId: string = '';
+  @Prop label: string = '';
+  @Prop imageWidth: number = 240;
+  @Prop imageHeight: number = 320;
+  @Prop slotHeight: number = 340;
+  onReady: (lensId: string, surfaceId: string) => void = (): void => {};
+  onLost: (lensId: string, surfaceId: string) => void = (): void => {};
+  private surfaceController: XComponentController = new XComponentController();
+  private loadedSurfaceId: string = '';
+
+  build() {
+    Stack({ alignContent: Alignment.Center }) {
+      XComponent({ id: `pairshot-preview-${this.lensId}`, type: XComponentType.SURFACE,
+        controller: this.surfaceController })
+        .width(this.imageWidth).height(this.imageHeight)
+        .onLoad(() => {
+          this.loadedSurfaceId = this.surfaceController.getXComponentSurfaceId();
+          this.onReady(this.lensId, this.loadedSurfaceId);
+        })
+        .onDestroy(() => {
+          this.onLost(this.lensId, this.loadedSurfaceId);
+          this.loadedSurfaceId = '';
+        })
+      Text(this.label).fontSize(11).fontColor('#FFFFFF').padding(6)
+        .backgroundColor('#88000000').borderRadius(6).align(Alignment.BottomStart).margin(6)
+    }.width('100%').height(this.slotHeight).clip(true).backgroundColor('#152128')
+  }
+}
+
 @Entry
 @Component
 struct Index {
   @State private state: ViewState = new ViewState();
   @State private allowIncomplete: boolean = false;
   @State private showHistory: boolean = false;
+  @State private previewWidth: number = 320;
   @StorageLink('pairshotActive') @Watch('onActiveChanged') private appActive: boolean = true;
   private controller: PairShotController | undefined = undefined;
-  private surfaceController: XComponentController = new XComponentController();
+
+  private lensLabel(lensId: string): string {
+    return this.state.lenses.find((lens: LensInfo): boolean => lens.id === lensId)?.label || lensId;
+  }
+
+  private slotHeight(): number {
+    return this.state.selectedLensIds.length > 1 ? 210 : 340;
+  }
+
+  private previewRatio(index: number): number {
+    return this.state.previewRatios[index] || 3 / 4;
+  }
+
+  private surfaceWidth(index: number): number {
+    const columns = this.state.selectedLensIds.length > 1 ? 2 : 1;
+    const slotWidth = (this.previewWidth - (columns - 1) * 6) / columns;
+    return Math.min(slotWidth, this.slotHeight() * this.previewRatio(index));
+  }
 
   aboutToAppear(): void {
     const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
@@ -42,7 +91,9 @@ struct Index {
 
   private shotDetail(shot: ShotRecord): string {
     const imported = shot.cameraPhotos.filter((photo) => photo.relativePath.length > 0).length;
-    const phone = `手机 ${shot.phonePhotos.length}/${shot.expectedLensIds.length}`;
+    const capture = shot.phoneCaptureMode === 'CONCURRENT' ? ' · 并发' :
+      (shot.phoneCaptureMode === 'SEQUENTIAL' ? ' · 顺序' : '');
+    const phone = `手机 ${shot.phonePhotos.length}/${shot.expectedLensIds.length}${capture}`;
     return shot.mode === 'PHONE_ONLY' ? phone : `${phone} · 相机原片 ${imported}/${shot.cameraPhotos.length}`;
   }
 
@@ -78,7 +129,7 @@ struct Index {
         Text('让每个视角，都有记录').fontSize(12).fontColor('#718087')
       }.alignItems(HorizontalAlign.Start)
       Blank()
-      Text('鸿蒙版 0.1.1').fontSize(11).fontColor('#3A6D70')
+      Text('鸿蒙版 0.2.0').fontSize(11).fontColor('#3A6D70')
         .padding({ left: 10, right: 10, top: 6, bottom: 6 })
         .backgroundColor('#E2EFED').borderRadius(12)
     }.width('100%').margin({ bottom: 18 })
@@ -90,15 +141,42 @@ struct Index {
   }
 
   @Builder
+  captureModeButton(label: string, mode: string) {
+    Button(label, { type: ButtonType.Normal }).fontSize(12).height(34).layoutWeight(1).borderRadius(9)
+      .backgroundColor(this.state.captureMode === mode ? '#DAEBE7' : '#2D4248')
+      .fontColor(this.state.captureMode === mode ? '#183B3C' : '#D0DDDE')
+      .enabled(!this.state.busy && !this.state.linked)
+      .onClick(() => { this.controller?.setCaptureMode(mode); })
+  }
+
+  @Builder
   preview() {
     Column({ space: 0 }) {
       Stack({ alignContent: Alignment.TopEnd }) {
-        if (this.state.permissionGranted) {
-          XComponent({ id: 'pairshot-preview', type: XComponentType.SURFACE, controller: this.surfaceController })
-            .width('100%').aspectRatio(this.state.previewAspectRatio)
-            .onLoad(() => {
-              this.controller?.attachSurface(this.surfaceController.getXComponentSurfaceId());
+        if (this.state.permissionGranted && this.state.selectedLensIds.length > 0) {
+          Grid() {
+            ForEach(this.state.selectedLensIds, (lensId: string, index: number) => {
+              GridItem() {
+                LensPreviewSurface({ lensId: lensId, label: this.lensLabel(lensId),
+                  imageWidth: this.surfaceWidth(index), imageHeight: this.surfaceWidth(index) / this.previewRatio(index),
+                  slotHeight: this.slotHeight(),
+                  onReady: (id: string, surfaceId: string): void => { this.controller?.attachLensSurface(id, surfaceId); },
+                  onLost: (id: string, surfaceId: string): void => { this.controller?.detachLensSurface(id, surfaceId); } })
+              }
+            }, (lensId: string) => lensId)
+          }.columnsTemplate(this.state.selectedLensIds.length > 1 ? '1fr 1fr' : '1fr')
+            .columnsGap(6).rowsGap(6).width('100%')
+            .height(this.slotHeight() * Math.ceil(this.state.selectedLensIds.length /
+              (this.state.selectedLensIds.length > 1 ? 2 : 1)) + (this.state.selectedLensIds.length > 2 ? 6 : 0))
+            .onAreaChange((_old: Area, area: Area) => {
+              const width = Number(area.width);
+              if (width > 0 && Math.abs(width - this.previewWidth) > 1) {
+                this.previewWidth = width;
+              }
             })
+        } else if (this.state.permissionGranted) {
+          Text('请选择手机镜头').fontSize(16).fontColor('#AAB8BD').height(220).width('100%')
+            .textAlign(TextAlign.Center)
         } else {
           Column({ space: 14 }) {
             Text('开启你的第一个视角').fontSize(20).fontColor('#FFFFFF').fontWeight(FontWeight.Medium)
@@ -116,7 +194,8 @@ struct Index {
         Row() {
           Text('选择镜头').fontSize(13).fontColor('#C6D5D7')
           Blank()
-          Text(this.state.selectedLensIds.length > 1 ? '双镜头 · 顺序拍摄' : '单镜头拍摄')
+          Text(this.state.selectedLensIds.length > 1 ? `${this.state.selectedLensIds.length} 镜头 · ` +
+            (this.state.captureMode === 'CONCURRENT' ? '并发拍摄' : '顺序拍摄') : '单镜头拍摄')
             .fontSize(11).fontColor('#8EA9AA')
         }.width('100%')
         if (this.state.lenses.length > 0) {
@@ -135,6 +214,26 @@ struct Index {
         } else {
           Text('授权后显示系统向应用开放的镜头').fontSize(12).fontColor('#8EA9AA')
         }
+        Row({ space: 6 }) {
+          Text(this.state.cameraSummary).fontSize(11).fontColor('#8EA9AA').layoutWeight(1)
+          Button('刷新', { type: ButtonType.Normal }).fontSize(11).height(30).borderRadius(8)
+            .fontColor('#D0DDDE').backgroundColor('#2D4248').enabled(!this.state.busy && !this.state.linked)
+            .onClick(() => { this.controller?.refreshCameras(); })
+          Button('复制镜头诊断', { type: ButtonType.Normal }).fontSize(11).height(30).borderRadius(8)
+            .fontColor('#D0DDDE').backgroundColor('#2D4248').enabled(!this.state.busy)
+            .onClick(() => { this.controller?.copyCameraDiagnostics(); })
+        }.width('100%')
+        if (this.state.selectedLensIds.length > 1) {
+          Row({ space: 6 }) {
+            this.captureModeButton('并发拍照', 'CONCURRENT')
+            this.captureModeButton('顺序拍照', 'SEQUENTIAL')
+          }.width('100%')
+          Text(this.state.captureMode === 'SEQUENTIAL' ? '按镜头顺序逐个拍摄，归为同一组。' :
+            (this.state.concurrentReason || (this.state.previewReady ? '多路会话就绪；并发提交快门，不承诺同时曝光。' :
+              '正在准备多路会话；全部就绪后才能拍摄。')))
+            .fontSize(12).fontColor(this.state.concurrentReason && this.state.captureMode === 'CONCURRENT' ? '#F2B798' : '#8EA9AA')
+            .width('100%').lineHeight(17)
+        }
         if (this.state.maxZoom > this.state.minZoom) {
           Row({ space: 8 }) {
             Text(`${this.state.minZoom.toFixed(1)}×`).fontSize(11).fontColor('#B8CDCE')
@@ -146,12 +245,13 @@ struct Index {
           }
         }
         Button(this.state.busy ? '正在处理…' :
-          (this.state.mode === 'PHONE_ONLY' ? '手机拍照' :
-            (this.state.mode === 'PHONE_TO_CAMERA' ? '同步拍照' : '相机快门触发跟拍')),
+          (this.state.mode === 'PHONE_ONLY' ?
+            (this.state.selectedLensIds.length > 1 ? (this.state.captureMode === 'CONCURRENT' ? '并发拍照' : '顺序拍照') : '手机拍照') :
+            (this.state.mode === 'PHONE_TO_CAMERA' ? '联动拍照' : '相机快门触发跟拍')),
           { type: ButtonType.Normal })
           .width('100%').height(50).borderRadius(14).fontSize(17).fontWeight(FontWeight.Bold)
           .fontColor('#FFFFFF').backgroundColor('#D96C43')
-          .enabled(!this.state.busy && this.state.permissionGranted && this.state.selectedLensIds.length > 0 &&
+          .enabled(!this.state.busy && this.state.permissionGranted && this.state.previewReady && this.state.selectedLensIds.length > 0 &&
             (this.state.mode === 'PHONE_ONLY' || (this.state.mode === 'PHONE_TO_CAMERA' && this.state.linked)))
           .onClick(() => { this.controller?.capture(); })
       }.width('100%').padding(14).backgroundColor('#1B3036')
@@ -202,7 +302,7 @@ struct Index {
       }
       Text(this.state.mode === 'CAMERA_TO_PHONE' ?
         '相机生成新照片后，手机延迟跟拍；不代表同时曝光。' :
-        '软件提交两端拍摄请求；多镜头逐个拍摄，不保证同时曝光。')
+        '软件提交两端拍摄请求；手机镜头按所选方式拍摄，不保证同时曝光。')
         .fontSize(12).fontColor('#8C7966').width('100%').lineHeight(18)
     }.width('100%').padding(16).backgroundColor('#FFFFFF').borderRadius(16).margin({ top: 14 })
   }

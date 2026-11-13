@@ -1,7 +1,14 @@
+export const MAX_PHONE_LENSES: number = 4;
+
 export class LensInfo {
   id: string = '';
   label: string = '';
   position: number = 0;
+  cameraType: number = 0;
+  source: string = '';
+  physical: boolean = false;
+  logical: boolean = false;
+  parentId: string = '';
 }
 
 export class CapturedPhoto {
@@ -9,6 +16,8 @@ export class CapturedPhoto {
   lensLabel: string = '';
   zoom: number = 1;
   capturedAt: number = 0;
+  captureMode: string = 'SINGLE';
+  shutterTimestampMs: number = 0;
   jpeg: ArrayBuffer = new ArrayBuffer(0);
 }
 
@@ -17,6 +26,8 @@ export class PhonePhoto {
   lensLabel: string = '';
   zoom: number = 1;
   capturedAt: number = 0;
+  captureMode: string = 'SINGLE';
+  shutterTimestampMs: number = 0;
   relativePath: string = '';
   bytes: number = 0;
   sha256: string = '';
@@ -38,6 +49,7 @@ export class ShotRecord {
   id: string = '';
   createdAt: number = 0;
   mode: string = 'PHONE_ONLY';
+  phoneCaptureMode: string = 'SINGLE';
   expectedLensIds: string[] = [];
   phonePhotos: PhonePhoto[] = [];
   cameraPhotos: CameraPhoto[] = [];

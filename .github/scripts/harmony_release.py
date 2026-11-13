@@ -45,9 +45,10 @@ def main():
         metadata = json.loads(archive.read('module.json'))['app']
         assert metadata['bundleName'] == app['bundleName']
         assert metadata['versionName'] == version
+        assert metadata['versionCode'] == app['versionCode']
         assert metadata['minAPIVersion'] == 50100018
         abc = archive.read('ets/modules.abc')
-        for module in ['CameraService', 'SessionStore', 'PtpCamera', 'PtpCodec', 'PairShotController', 'EntryAbility', 'Index']:
+        for module in ['CameraService', 'CameraCatalog', 'CameraChannel', 'SessionStore', 'PtpCamera', 'PtpCodec', 'PairShotController', 'EntryAbility', 'Index']:
             assert module.encode() in abc, f'Missing compiled module: {module}'
     logs = repo / 'work/harmony-release'
     tests = (logs / 'tests.log').read_text()
@@ -93,16 +94,21 @@ def main():
 - 适用 HarmonyOS 5.1 / API 18 及以上，包名 `{app['bundleName']}`。
 - 请以当前包名注册应用并生成对应的签名 Profile；旧包名的 Profile 不能用于此包。0.1.1 已修复旧包名包含保留段 `harmony` 的问题。
 - `{stem}-source.zip` 为独立鸿蒙源码；使用、构建和签名说明见 `HarmonyOS-README.md`，附件校验值见 `SHA256SUMS`。
+- `git clone` 默认检出 Android `master` 分支。请克隆 `harmonyos/native-v0.1.0` 分支，并在 DevEco 中打开仓库的 `harmonyos/` 子目录。独立源码 ZIP 直接打开解压后的 `PairShot-HarmonyOS` 目录；GitHub 自带 `Source code (zip)` 仍须打开其中的 `harmonyos/`。
 
 ## 功能
 
-系统公开镜头枚举、预览、变焦、最多双镜头顺序 JPEG 拍摄；USB/PTP 连接与双向联动；第一代 Nikon Z6 精确协议适配；RAW/JPEG 配对、流式原片导入、历史恢复、大小和 SHA-256 校验及 ZIP 导出。
+0.2.0 增加扩展和物理组成相机查询、最多四镜头选择、多路预览、JPEG 并发能力检查及独立并发拍照会话。全部会话就绪后并发提交快门，每张照片立即保存；不支持 JPEG 并发的组合会显示原因，不自动转成顺序拍摄。保留手动选择的顺序拍照和可复制的镜头诊断。
+
+同时包含 USB/PTP 双向联动、第一代 Nikon Z6 精确协议适配、RAW/JPEG 配对、流式导入、历史恢复及校验 ZIP 导出。
 
 ## 验证与限制
 
 GitHub Actions 使用官方固定版本工具链构建通过，{passed[1]} 项自动化测试通过。测试使用模拟 SDK，**摄像头、USB/PTP 及 Nikon 功能仍需真机验收**。
 
-双镜头按顺序拍摄，联动不保证同时曝光；相机生成文件后延迟跟拍。扫描间隔 1.5 秒、归组静默窗口 3 秒、等待文件最长 45 秒；ZIP 小于 4 GiB。
+华为多摄文档仍将前后摄同时拍照标为待开放；本版只在设备实际声明 JPEG 并发能力且会话建立成功时启用并发拍照，不保证任意设备/后置物理镜头组合可用。并发快门和 USB 联动都不保证同时曝光。新镜头 API 使用运行时能力检测，旧系统回退到基础/按类型查询。
+
+相机生成文件后延迟跟拍。扫描间隔 1.5 秒、归组静默窗口 3 秒、等待文件最长 45 秒；ZIP 小于 4 GiB。
 
 源码提交：`{commit}`。构建：CLI 5.1.0.840 / Hvigor 5.18.5 / SDK 5.1.0.125。
 

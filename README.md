@@ -1,6 +1,15 @@
 # PairShot · Android 手机多焦距与相机联动拍摄
 
-新增原生 HarmonyOS 5.1 / API 18 工程：[鸿蒙版源码、HAP 构建与签名说明](harmonyos/README.md)。鸿蒙版使用 ArkTS / ArkUI，实现手机镜头顺序拍摄、USB/PTP 联动和 ZIP 归档；真机兼容性仍需设备验证。下文介绍 Android 版。
+新增原生 HarmonyOS 5.1 / API 18 工程：[鸿蒙版源码、HAP 构建与签名说明](harmonyos/README.md)。鸿蒙版使用 ArkTS / ArkUI，实现扩展物理镜头查询、系统能力允许的多镜头并发拍照、显式顺序拍照、USB/PTP 联动和 ZIP 归档；真机兼容性仍需设备验证。下文介绍 Android 版。
+
+**在 DevEco Studio 中打开鸿蒙版：** `master` 默认分支是 Android 工程。请克隆鸿蒙独立分支，并打开其中的 `harmonyos` 子目录：
+
+```bash
+git clone --branch harmonyos/native-v0.1.0 --single-branch https://github.com/yqwu905/PairShot.git PairShot-harmony
+cd PairShot-harmony/harmonyos
+```
+
+Release 的 `PairShot-HarmonyOS-<版本>-source.zip` 只打包鸿蒙子工程，解压后可打开包含 `AppScope` 和 `build-profile.json5` 的目录；GitHub 自动生成的 `Source code (zip)` 则包含整个仓库，需打开其中的 `harmonyos`。同一标签对应的鸿蒙源码内容一致，独立源码包附有 `SOURCE-SHA256.json`。详细说明见 [DevEco 导入与源码版本对应关系](harmonyos/DEVECO.md)。
 
 [![Android CI/CD](https://github.com/yqwu905/PairShot/actions/workflows/android.yml/badge.svg)](https://github.com/yqwu905/PairShot/actions/workflows/android.yml)
 [下载自动构建的 APK](https://github.com/yqwu905/PairShot/releases) · [CI/CD 与签名配置](docs/ci-cd.md)

@@ -275,4 +275,44 @@ test('picker cancellation leaves source photos intact and permits another operat
   assert.doesNotThrow(() => store.newSession());
 });
 
+test('four concurrent JPEGs persist their capture mode and raw shutter timestamps through restart and ZIP export', async () => {
+  const { store, context } = await fixture();
+  const ids = ['main', 'tele', 'ultra', 'front'];
+  const shot = store.createShot('PHONE_ONLY', ids);
+  shot.phoneCaptureMode = 'CONCURRENT';
+  await Promise.all(ids.map(async (id, index) => {
+    const captured = photo(id);
+    captured.captureMode = 'CONCURRENT'; captured.shutterTimestampMs = 1000 + index * 0.5;
+    await store.addPhonePhoto(shot, captured);
+  }));
+  assert.equal(store.isComplete(shot), true);
+  shot.status = 'complete'; store.save();
+  const restored = new SessionStore(context);
+  await restored.initialize();
+  const result = zipContents(await restored.exportZip(false));
+  const record = result.manifest.shots[0];
+  assert.equal(record.phoneCaptureMode, 'CONCURRENT');
+  assert.deepEqual(record.phonePhotos.map(saved => saved.shutterTimestampMs).sort(), [1000, 1000.5, 1001, 1001.5]);
+  assert.ok(record.phonePhotos.every(saved => saved.captureMode === 'CONCURRENT'));
+  assert.equal(result.names.length, 5);
+});
+
+test('pre-multicamera histories without capture-mode fields still load and export', async () => {
+  const { store, context } = await fixture();
+  const shot = store.createShot('PHONE_ONLY', ['0']);
+  await store.addPhonePhoto(shot, photo());
+  shot.status = 'complete'; store.save();
+  const id = store.getCurrent().id;
+  const manifest = path.join(context.filesDir, 'pairshot', id, 'session.json');
+  const legacy = JSON.parse(fs.readFileSync(manifest, 'utf8'));
+  delete legacy.shots[0].phoneCaptureMode;
+  delete legacy.shots[0].phonePhotos[0].captureMode;
+  delete legacy.shots[0].phonePhotos[0].shutterTimestampMs;
+  fs.writeFileSync(manifest, JSON.stringify(legacy));
+  const restored = new SessionStore(context);
+  await restored.initialize();
+  assert.equal(restored.isComplete(restored.getCurrent().shots[0]), true);
+  assert.equal(zipContents(await restored.exportZip(false)).names.length, 2);
+});
+
 after(() => fs.rmSync(root, { recursive: true, force: true }));
