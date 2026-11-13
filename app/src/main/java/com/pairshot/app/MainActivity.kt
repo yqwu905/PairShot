@@ -195,7 +195,7 @@ internal fun CameraScreen(model: CameraViewModel = viewModel()) {
                                         }
                                     }
                                 } else {
-                                    val selected = phone.lenses.filter { it.key in phone.selected }
+                                    val selected = phone.selected.mapNotNull { key -> phone.lenses.firstOrNull { it.key == key } }
                                     Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                         selected.forEach { lens ->
                                             key(lens.key) {
