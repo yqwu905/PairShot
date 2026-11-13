@@ -1,6 +1,8 @@
 # PairShot · 原生鸿蒙版
 
-原生 ArkTS / ArkUI 工程，包名 `com.pairshot.harmony`，开发测试版本 `0.1.0`。面向 HarmonyOS 5.1 / API 18 及以上的手机和平板；不是 Android APK 的格式转换。
+原生 ArkTS / ArkUI 工程，包名 `com.pairshot.capture`，开发测试版本 `0.1.1`。面向 HarmonyOS 5.1 / API 18 及以上的手机和平板；不是 Android APK 的格式转换。
+
+0.1.1 修复了旧包名含有 AppGallery Connect 保留段 `harmony` 的问题。请使用新包名 `com.pairshot.capture` 注册应用并重新生成对应的签名 Profile；为旧包名生成的 Profile 不能用于新包。发布流程会检查包名格式及 `oh`、`ohos`、`harmony`、`harmonyos`、`openharmony`、`system` 等保留段。规则来源：[华为创建应用文档](https://developer.huawei.com/consumer/cn/doc/App/agc-help-create-app-0000002247955506/)。
 
 ## 功能
 

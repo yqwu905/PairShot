@@ -10,6 +10,22 @@ import subprocess
 import zipfile
 
 
+def validate_bundle_name(bundle_name):
+    """Validate AGC naming rules, including reserved standalone segments."""
+    if not isinstance(bundle_name, str) or not 7 <= len(bundle_name.encode('utf-8')) <= 128:
+        raise ValueError('Bundle name must contain 7 to 128 bytes')
+    parts = bundle_name.split('.')
+    if len(parts) < 3:
+        raise ValueError('Bundle name must contain at least three segments')
+    reserved = {'oh', 'ohos', 'harmony', 'harmonyos', 'openharmony', 'system'}
+    for index, part in enumerate(parts):
+        pattern = r'[A-Za-z][A-Za-z0-9_]*' if index == 0 else r'[A-Za-z0-9][A-Za-z0-9_]*'
+        if not re.fullmatch(pattern, part) or not part[-1].isalnum():
+            raise ValueError('Invalid bundle name segment: ' + part)
+        if part.lower() in reserved:
+            raise ValueError('Reserved bundle name segment: ' + part)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--tag', required=True)
@@ -18,6 +34,7 @@ def main():
     repo = Path(__file__).resolve().parents[2]
     project = repo / 'harmonyos'
     app = json.loads((project / 'AppScope/app.json5').read_text())['app']
+    validate_bundle_name(app['bundleName'])
     version = app['versionName']
     if args.tag != f'harmonyos-v{version}':
         raise SystemExit('Release tag must match AppScope app versionName')
@@ -67,13 +84,14 @@ def main():
     )
     checksum_files = sorted(path for path in assets.iterdir() if path.is_file() and path.name != 'SHA256SUMS')
     (assets / 'SHA256SUMS').write_text(''.join(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n' for path in checksum_files))
-    (output / 'notes.md').write_text(f'''PairShot 首个原生鸿蒙开发测试版，源码位于独立分支 `harmonyos/native-v0.1.0` 的 `harmonyos/` 目录。
+    (output / 'notes.md').write_text(f'''PairShot 原生鸿蒙开发测试版 {version}，源码位于独立分支 `harmonyos/native-v0.1.0` 的 `harmonyos/` 目录。
 
 ## 下载与安装
 
 - `{stem}-unsigned.hap`：原生鸿蒙 HAP，{hap.stat().st_size:,} 字节。
 - **未签名 Debug HAP：需在 DevEco Studio 中为目标设备配置自己的调试签名后重新构建安装，不能直接作为已签名安装包安装。**
 - 适用 HarmonyOS 5.1 / API 18 及以上，包名 `{app['bundleName']}`。
+- 请以当前包名注册应用并生成对应的签名 Profile；旧包名的 Profile 不能用于此包。0.1.1 已修复旧包名包含保留段 `harmony` 的问题。
 - `{stem}-source.zip` 为独立鸿蒙源码；使用、构建和签名说明见 `HarmonyOS-README.md`，附件校验值见 `SHA256SUMS`。
 
 ## 功能

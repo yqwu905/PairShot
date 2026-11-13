@@ -78,7 +78,7 @@ struct Index {
         Text('让每个视角，都有记录').fontSize(12).fontColor('#718087')
       }.alignItems(HorizontalAlign.Start)
       Blank()
-      Text('鸿蒙版 0.1').fontSize(11).fontColor('#3A6D70')
+      Text('鸿蒙版 0.1.1').fontSize(11).fontColor('#3A6D70')
         .padding({ left: 10, right: 10, top: 6, bottom: 6 })
         .backgroundColor('#E2EFED').borderRadius(12)
     }.width('100%').margin({ bottom: 18 })

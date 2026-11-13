@@ -54,6 +54,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p work/harmony-release
+          python3 -m unittest discover -s .github/scripts -p 'test_harmony_release.py' -v
           node --test --test-reporter=tap harmonyos/tests/*.test.cjs | tee work/harmony-release/tests.log
       - name: Build unsigned HAP
         shell: bash
